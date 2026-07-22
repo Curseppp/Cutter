@@ -84,13 +84,8 @@ private struct Sidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 7) {
-                Label("Фон — долой!", systemImage: "wand.and.sparkles")
-                    .font(.title2.weight(.semibold))
-                Text("Локально на вашем Mac")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Label("Фон — долой!", systemImage: "wand.and.sparkles")
+                .font(.title2.weight(.semibold))
             .padding(.horizontal, 18)
             .padding(.top, 20)
             .padding(.bottom, 22)
@@ -182,11 +177,6 @@ private struct Sidebar: View {
             }
 
             Spacer(minLength: 0)
-
-            Label("Фото обрабатывается офлайн", systemImage: "lock.shield")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(18)
         }
         .background(.regularMaterial)
     }
@@ -264,7 +254,7 @@ private struct PreviewWorkspace: View {
                 switch appState.previewMode {
                 case .result:
                     PreviewSurface(
-                        image: appState.resultImage ?? appState.originalImage,
+                        image: appState.resultPreviewImage ?? appState.resultImage ?? appState.originalImage,
                         background: appState.previewBackground,
                         label: "Результат"
                     )
@@ -318,7 +308,7 @@ private struct PreviewSurface: View {
     let label: String
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
+        ZStack {
             PreviewBackgroundView(style: background)
 
             if let image {
@@ -329,7 +319,10 @@ private struct PreviewSurface: View {
                     .aspectRatio(contentMode: .fit)
                     .padding(24)
             }
-
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(alignment: .topLeading) {
             Text(label)
                 .font(.caption.weight(.medium))
                 .padding(.horizontal, 9)
@@ -337,8 +330,6 @@ private struct PreviewSurface: View {
                 .background(.ultraThickMaterial, in: Capsule())
                 .padding(12)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(.secondary.opacity(0.2))

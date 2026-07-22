@@ -85,6 +85,66 @@ enum BackgroundRemovalService {
         )
     }
 
+    static func centeredPreviewCrop(from source: CGImage) -> CGImage {
+        let width = source.width
+        let height = source.height
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return source }
+
+        let image = CIImage(cgImage: source)
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            context.render(
+                image,
+                toBitmap: baseAddress,
+                rowBytes: width * 4,
+                bounds: extent,
+                format: .RGBA8,
+                colorSpace: colorSpace
+            )
+        }
+
+        var minimumX = width
+        var minimumY = height
+        var maximumX = -1
+        var maximumY = -1
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let alpha = pixels[(y * width + x) * 4 + 3]
+                guard alpha >= 12 else { continue }
+                minimumX = min(minimumX, x)
+                minimumY = min(minimumY, y)
+                maximumX = max(maximumX, x)
+                maximumY = max(maximumY, y)
+            }
+        }
+
+        guard maximumX >= minimumX, maximumY >= minimumY else { return source }
+
+        let contentWidth = maximumX - minimumX + 1
+        let contentHeight = maximumY - minimumY + 1
+        let padding = max(12, Int((CGFloat(max(contentWidth, contentHeight)) * 0.04).rounded()))
+        let cropMinimumX = max(0, minimumX - padding)
+        let cropMinimumY = max(0, minimumY - padding)
+        let cropMaximumX = min(width - 1, maximumX + padding)
+        let cropMaximumY = min(height - 1, maximumY + padding)
+        let coreImageMinimumY = height - cropMaximumY - 1
+        let cropRect = CGRect(
+            x: cropMinimumX,
+            y: coreImageMinimumY,
+            width: cropMaximumX - cropMinimumX + 1,
+            height: cropMaximumY - cropMinimumY + 1
+        )
+
+        guard cropRect.width < CGFloat(width) || cropRect.height < CGFloat(height),
+              let cropped = context.createCGImage(image, from: cropRect) else {
+            return source
+        }
+        return cropped
+    }
+
     private static func removeChromaBackground(from source: CGImage) throws -> CGImage? {
         let width = source.width
         let height = source.height

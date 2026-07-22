@@ -82,6 +82,35 @@ final class BackgroundRemovalServiceTests: XCTestCase {
         XCTAssertLessThanOrEqual(green, max(red, blue) + 2)
     }
 
+    func testCenteredPreviewCropRemovesTransparentMarginsWithoutLosingContent() throws {
+        let width = 100
+        let height = 100
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+
+        for y in 20..<60 {
+            for x in 10..<30 {
+                let index = (y * width + x) * 4
+                pixels[index] = 220
+                pixels[index + 1] = 80
+                pixels[index + 2] = 140
+                pixels[index + 3] = 255
+            }
+        }
+
+        let input = try makeImage(pixels: pixels, width: width, height: height)
+        let cropped = BackgroundRemovalService.centeredPreviewCrop(from: input)
+        let croppedPixels = try rgbaPixels(from: cropped)
+        let opaquePixelCount = stride(from: 3, to: croppedPixels.count, by: 4)
+            .filter { croppedPixels[$0] > 0 }
+            .count
+
+        XCTAssertLessThan(cropped.width, width)
+        XCTAssertLessThan(cropped.height, height)
+        XCTAssertGreaterThanOrEqual(cropped.width, 20)
+        XCTAssertGreaterThanOrEqual(cropped.height, 40)
+        XCTAssertEqual(opaquePixelCount, 20 * 40)
+    }
+
     private func makeImage(pixels: [UInt8], width: Int, height: Int) throws -> CGImage {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let provider = CGDataProvider(data: Data(pixels) as CFData),

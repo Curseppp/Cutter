@@ -38,6 +38,7 @@ final class AppState: ObservableObject {
 
     @Published private(set) var originalImage: NSImage?
     @Published private(set) var resultImage: NSImage?
+    @Published private(set) var resultPreviewImage: NSImage?
     @Published private(set) var sourceURL: URL?
     @Published private(set) var isProcessing = false
     @Published var errorMessage: String?
@@ -77,6 +78,7 @@ final class AppState: ObservableObject {
         sourceURL = url
         originalImage = image
         resultImage = nil
+        resultPreviewImage = nil
         previewMode = .result
         errorMessage = nil
         removeBackground()
@@ -91,6 +93,7 @@ final class AppState: ObservableObject {
         sourceURL = nil
         originalImage = image
         resultImage = nil
+        resultPreviewImage = nil
         previewMode = .result
         errorMessage = nil
         removeBackground()
@@ -120,18 +123,25 @@ final class AppState: ObservableObject {
         operationID = currentOperationID
         isProcessing = true
         resultImage = nil
+        resultPreviewImage = nil
         errorMessage = nil
 
         processingTask = Task {
             do {
-                let output = try await Task.detached(priority: .userInitiated) {
-                    try BackgroundRemovalService.removeBackground(from: source)
+                let images = try await Task.detached(priority: .userInitiated) {
+                    let output = try BackgroundRemovalService.removeBackground(from: source)
+                    let preview = BackgroundRemovalService.centeredPreviewCrop(from: output)
+                    return (output, preview)
                 }.value
 
                 guard !Task.isCancelled, operationID == currentOperationID else { return }
                 resultImage = NSImage(
-                    cgImage: output,
-                    size: NSSize(width: output.width, height: output.height)
+                    cgImage: images.0,
+                    size: NSSize(width: images.0.width, height: images.0.height)
+                )
+                resultPreviewImage = NSImage(
+                    cgImage: images.1,
+                    size: NSSize(width: images.1.width, height: images.1.height)
                 )
                 isProcessing = false
             } catch is CancellationError {
@@ -177,6 +187,7 @@ final class AppState: ObservableObject {
         operationID = UUID()
         originalImage = nil
         resultImage = nil
+        resultPreviewImage = nil
         sourceURL = nil
         isProcessing = false
         errorMessage = nil
