@@ -307,17 +307,20 @@ private struct PreviewSurface: View {
     let background: AppState.PreviewBackground
     let label: String
 
+    @State private var zoomScale: CGFloat = 1
+    @State private var panOffset: CGSize = .zero
+    @GestureState private var gestureMagnification: CGFloat = 1
+    @GestureState private var gestureTranslation: CGSize = .zero
+
+    private let minimumZoom: CGFloat = 0.25
+    private let maximumZoom: CGFloat = 8
+
     var body: some View {
         ZStack {
             PreviewBackgroundView(style: background)
 
             if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .interpolation(.high)
-                    .antialiased(true)
-                    .aspectRatio(contentMode: .fit)
-                    .padding(24)
+                interactiveImage(image)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -330,9 +333,186 @@ private struct PreviewSurface: View {
                 .background(.ultraThickMaterial, in: Capsule())
                 .padding(12)
         }
+        .overlay(alignment: .bottomTrailing) {
+            if image != nil {
+                zoomControls
+                    .padding(12)
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(.secondary.opacity(0.2))
+        }
+        .onChange(of: imageIdentifier) {
+            resetViewport()
+        }
+    }
+
+    private var imageIdentifier: ObjectIdentifier? {
+        image.map(ObjectIdentifier.init)
+    }
+
+    private var visibleZoomScale: CGFloat {
+        clampedZoom(zoomScale * gestureMagnification)
+    }
+
+    private var zoomControls: some View {
+        HStack(spacing: 3) {
+            Button {
+                changeZoom(by: 1 / 1.25)
+            } label: {
+                Image(systemName: "minus")
+                    .frame(width: 24, height: 24)
+            }
+            .help("Уменьшить")
+
+            Button {
+                resetViewport()
+            } label: {
+                Text("\(Int((zoomScale * 100).rounded()))%")
+                    .monospacedDigit()
+                    .frame(minWidth: 46)
+            }
+            .help("Вписать изображение")
+
+            Button {
+                changeZoom(by: 1.25)
+            } label: {
+                Image(systemName: "plus")
+                    .frame(width: 24, height: 24)
+            }
+            .help("Увеличить")
+
+            Divider()
+                .frame(height: 18)
+                .padding(.horizontal, 3)
+
+            Button {
+                resetViewport()
+            } label: {
+                Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    .frame(width: 24, height: 24)
+            }
+            .help("Вернуть по центру")
+        }
+        .padding(5)
+        .buttonStyle(.plain)
+        .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(.secondary.opacity(0.2))
+        }
+    }
+
+    private func interactiveImage(_ image: NSImage) -> some View {
+        GeometryReader { geometry in
+            let viewportSize = CGSize(
+                width: max(geometry.size.width - 48, 1),
+                height: max(geometry.size.height - 48, 1)
+            )
+            let fittedSize = aspectFitSize(image.size, in: viewportSize)
+            let proposedOffset = CGSize(
+                width: panOffset.width + gestureTranslation.width,
+                height: panOffset.height + gestureTranslation.height
+            )
+            let displayedOffset = constrainedOffset(
+                proposedOffset,
+                fittedSize: fittedSize,
+                viewportSize: viewportSize,
+                scale: visibleZoomScale
+            )
+
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .antialiased(true)
+                .frame(width: fittedSize.width, height: fittedSize.height)
+                .scaleEffect(visibleZoomScale)
+                .position(
+                    x: geometry.size.width / 2 + displayedOffset.width,
+                    y: geometry.size.height / 2 + displayedOffset.height
+                )
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .updating($gestureTranslation) { value, state, _ in
+                            state = value.translation
+                        }
+                        .onEnded { value in
+                            let proposed = CGSize(
+                                width: panOffset.width + value.translation.width,
+                                height: panOffset.height + value.translation.height
+                            )
+                            panOffset = constrainedOffset(
+                                proposed,
+                                fittedSize: fittedSize,
+                                viewportSize: viewportSize,
+                                scale: zoomScale
+                            )
+                        }
+                )
+                .simultaneousGesture(
+                    MagnificationGesture()
+                        .updating($gestureMagnification) { value, state, _ in
+                            state = value
+                        }
+                        .onEnded { value in
+                            let newScale = clampedZoom(zoomScale * value)
+                            zoomScale = newScale
+                            panOffset = constrainedOffset(
+                                panOffset,
+                                fittedSize: fittedSize,
+                                viewportSize: viewportSize,
+                                scale: newScale
+                            )
+                        }
+                )
+                .onTapGesture(count: 2) {
+                    resetViewport()
+                }
+                .animation(.snappy(duration: 0.2), value: zoomScale)
+                .animation(.snappy(duration: 0.2), value: panOffset)
+        }
+        .clipped()
+    }
+
+    private func aspectFitSize(_ imageSize: CGSize, in viewportSize: CGSize) -> CGSize {
+        guard imageSize.width > 0, imageSize.height > 0 else { return viewportSize }
+        let scale = min(viewportSize.width / imageSize.width, viewportSize.height / imageSize.height)
+        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+    }
+
+    private func constrainedOffset(
+        _ proposed: CGSize,
+        fittedSize: CGSize,
+        viewportSize: CGSize,
+        scale: CGFloat
+    ) -> CGSize {
+        let scaledWidth = fittedSize.width * scale
+        let scaledHeight = fittedSize.height * scale
+        let maximumX = abs(viewportSize.width - scaledWidth) / 2
+        let maximumY = abs(viewportSize.height - scaledHeight) / 2
+
+        return CGSize(
+            width: min(max(proposed.width, -maximumX), maximumX),
+            height: min(max(proposed.height, -maximumY), maximumY)
+        )
+    }
+
+    private func clampedZoom(_ value: CGFloat) -> CGFloat {
+        min(max(value, minimumZoom), maximumZoom)
+    }
+
+    private func changeZoom(by multiplier: CGFloat) {
+        withAnimation(.snappy(duration: 0.2)) {
+            zoomScale = clampedZoom(zoomScale * multiplier)
+        }
+    }
+
+    private func resetViewport() {
+        withAnimation(.snappy(duration: 0.2)) {
+            zoomScale = 1
+            panOffset = .zero
         }
     }
 }
