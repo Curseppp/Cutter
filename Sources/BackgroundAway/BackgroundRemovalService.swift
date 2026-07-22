@@ -22,6 +22,12 @@ enum BackgroundRemovalError: LocalizedError {
 }
 
 enum BackgroundRemovalService {
+    struct CompositionLayer {
+        let image: CGImage
+        let offset: CGSize
+        let scale: CGFloat
+    }
+
     private struct ChromaBackground {
         let red: CGFloat
         let green: CGFloat
@@ -235,6 +241,40 @@ enum BackgroundRemovalService {
         guard let output = blend.outputImage?.cropped(to: extent),
               let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
               let rendered = context.createCGImage(output, from: extent, format: .RGBA8, colorSpace: colorSpace) else {
+            throw BackgroundRemovalError.cannotCreateImage
+        }
+        return rendered
+    }
+
+    static func compose(
+        layers: [CompositionLayer],
+        canvasSize: CGSize
+    ) throws -> CGImage {
+        let width = max(Int(canvasSize.width.rounded()), 1)
+        let height = max(Int(canvasSize.height.rounded()), 1)
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+        var composition = CIImage(color: .clear).cropped(to: extent)
+
+        for layer in layers {
+            let scale = max(layer.scale, 0.001)
+            let scaled = CIImage(cgImage: layer.image)
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            let originX = CGFloat(width) / 2 + layer.offset.width - scaled.extent.width / 2
+            let originY = CGFloat(height) / 2 - layer.offset.height - scaled.extent.height / 2
+            let positioned = scaled.transformed(by: CGAffineTransform(
+                translationX: originX - scaled.extent.minX,
+                y: originY - scaled.extent.minY
+            ))
+            composition = positioned.composited(over: composition)
+        }
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let rendered = context.createCGImage(
+                  composition.cropped(to: extent),
+                  from: extent,
+                  format: .RGBA8,
+                  colorSpace: colorSpace
+              ) else {
             throw BackgroundRemovalError.cannotCreateImage
         }
         return rendered

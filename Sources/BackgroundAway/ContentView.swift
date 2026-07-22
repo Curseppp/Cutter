@@ -11,7 +11,7 @@ struct ContentView: View {
             Color(nsColor: .windowBackgroundColor)
                 .ignoresSafeArea()
 
-            if appState.originalImage == nil {
+            if appState.layers.isEmpty {
                 EmptyDropView(isTargeted: isDropTargeted) {
                     appState.openImagePicker()
                 }
@@ -20,17 +20,26 @@ struct ContentView: View {
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first,
-                  UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true else {
-                return false
+            let imageURLs = urls.filter {
+                UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true
             }
-            appState.loadImage(from: url)
+            guard !imageURLs.isEmpty else { return false }
+
+            if appState.layers.isEmpty, let first = imageURLs.first {
+                appState.loadImage(from: first)
+                let additionalImages = Array(imageURLs.dropFirst())
+                if !additionalImages.isEmpty {
+                    appState.addLayers(from: additionalImages, kind: .object)
+                }
+            } else {
+                appState.addLayers(from: imageURLs, kind: .object)
+            }
             return true
         } isTargeted: { targeted in
             isDropTargeted = targeted
         }
         .overlay {
-            if isDropTargeted, appState.originalImage != nil {
+            if isDropTargeted, !appState.layers.isEmpty {
                 RoundedRectangle(cornerRadius: 18)
                     .strokeBorder(.tint, style: StrokeStyle(lineWidth: 4, dash: [10, 8]))
                     .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
@@ -39,13 +48,16 @@ struct ContentView: View {
             }
         }
         .background {
-            if appState.originalImage != nil {
+            if !appState.layers.isEmpty {
                 WorkspaceKeyboardShortcutCapture(
-                    canEditMask: appState.resultImage != nil && !appState.isProcessing,
+                    canEditMask: canEditSelectedMask,
                     canUndoMaskEdit: appState.canUndoMaskEdit,
+                    canRedoMaskEdit: appState.canRedoMaskEdit,
                     selectTool: { appState.maskTool = $0 },
                     selectPreview: { appState.previewMode = $0 },
-                    undoMaskEdit: { appState.undoLastMaskEdit() }
+                    undoMaskEdit: { appState.undoLastMaskEdit() },
+                    redoMaskEdit: { appState.redoLastMaskEdit() },
+                    deselectLayer: { appState.deselectLayer() }
                 )
                 .frame(width: 0, height: 0)
                 .allowsHitTesting(false)
@@ -59,7 +71,7 @@ struct ContentView: View {
             set: { if !$0 { appState.errorMessage = nil } }
         )) {
             Button("Понятно", role: .cancel) {}
-            if appState.originalImage != nil {
+            if selectedLayer?.kind == .object {
                 Button("Попробовать ещё раз") {
                     appState.removeBackground()
                 }
@@ -67,6 +79,16 @@ struct ContentView: View {
         } message: {
             Text(appState.errorMessage ?? "Неизвестная ошибка")
         }
+    }
+
+    private var selectedLayer: AppState.ImageLayer? {
+        guard let selectedLayerID = appState.selectedLayerID else { return nil }
+        return appState.layers.first(where: { $0.id == selectedLayerID })
+    }
+
+    private var canEditSelectedMask: Bool {
+        guard let selectedLayer else { return false }
+        return selectedLayer.isVisible && !selectedLayer.isProcessing
     }
 }
 
@@ -112,103 +134,206 @@ private struct EmptyDropView: View {
     }
 }
 
+private enum ComparisonPane {
+    case original
+    case result
+}
+
+private struct SurfaceViewport: Equatable {
+    var zoomScale: CGFloat = 1
+    var centerOffset: CGSize = .zero
+}
+
 private struct PreviewWorkspace: View {
     @ObservedObject var appState: AppState
+    @State private var originalViewport = SurfaceViewport()
+    @State private var resultViewport = SurfaceViewport()
+    @State private var comparisonViewportsLinked = false
+    @State private var lastInteractedPane: ComparisonPane = .result
 
     var body: some View {
         VStack(spacing: 12) {
-            WorkspaceTopBar(appState: appState)
+            WorkspaceTopBar(
+                appState: appState,
+                comparisonViewportsLinked: comparisonViewportsLinked,
+                onToggleComparisonViewports: toggleComparisonViewports
+            )
 
             HStack(spacing: 12) {
                 MaskToolPalette(appState: appState)
 
                 previewContent
-                    .overlay {
-                        if appState.isProcessing {
-                            ZStack {
-                                Rectangle()
-                                    .fill(.black.opacity(0.18))
-                                VStack(spacing: 12) {
-                                    ProgressView()
-                                        .controlSize(.large)
-                                    Text("Удаляем фон…")
-                                        .font(.headline)
-                                }
-                                .padding(.horizontal, 24)
-                                .padding(.vertical, 18)
-                                .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(alignment: .top) {
+                        if appState.isSelectedLayerProcessing {
+                            HStack(spacing: 9) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Обрабатываем выбранный слой…")
+                                    .font(.callout.weight(.medium))
                             }
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(.ultraThickMaterial, in: Capsule())
+                            .padding(12)
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if appState.previewMode != .original,
+                           let selectedLayerID = appState.selectedLayerID {
+                            SelectedLayerInspector(
+                                appState: appState,
+                                layerID: selectedLayerID
+                            )
+                            .id(selectedLayerID)
+                            .padding(12)
                         }
                     }
             }
         }
         .padding(14)
+        .onChange(of: appState.documentID) { _, _ in
+            originalViewport = SurfaceViewport()
+            resultViewport = SurfaceViewport()
+            lastInteractedPane = .result
+        }
     }
 
     @ViewBuilder
     private var previewContent: some View {
         switch appState.previewMode {
         case .result:
-            PreviewSurface(
-                image: isMaskPainting
-                    ? appState.resultImage
-                    : appState.resultPreviewImage ?? appState.resultImage ?? appState.originalImage,
+            CompositionSurface(
+                appState: appState,
                 background: appState.previewBackground,
+                useOriginals: false,
+                allowsLayerEditing: true,
+                allowsMaskPainting: true,
                 label: "",
-                viewportIdentity: sourceIdentity,
-                maskEditing: maskEditingConfiguration
+                viewport: viewportBinding(for: .result),
+                onInteraction: { markInteraction(.result) }
             )
         case .original:
-            PreviewSurface(
-                image: appState.originalImage,
+            CompositionSurface(
+                appState: appState,
                 background: .white,
+                useOriginals: true,
+                allowsLayerEditing: false,
+                allowsMaskPainting: false,
                 label: "",
-                viewportIdentity: sourceIdentity
+                viewport: viewportBinding(for: .original),
+                onInteraction: { markInteraction(.original) }
             )
         case .comparison:
             HStack(spacing: 12) {
-                PreviewSurface(
-                    image: appState.originalImage,
+                CompositionSurface(
+                    appState: appState,
                     background: .white,
+                    useOriginals: true,
+                    allowsLayerEditing: true,
+                    allowsMaskPainting: false,
                     label: "Оригинал",
-                    viewportIdentity: sourceIdentity
+                    viewport: viewportBinding(for: .original),
+                    onInteraction: { markInteraction(.original) }
                 )
-                PreviewSurface(
-                    image: appState.resultImage ?? appState.originalImage,
+                CompositionSurface(
+                    appState: appState,
                     background: appState.previewBackground,
+                    useOriginals: false,
+                    allowsLayerEditing: true,
+                    allowsMaskPainting: true,
                     label: "Результат",
-                    viewportIdentity: sourceIdentity
+                    viewport: viewportBinding(for: .result),
+                    onInteraction: { markInteraction(.result) }
                 )
             }
         }
     }
 
-    private var sourceIdentity: ObjectIdentifier? {
-        appState.originalImage.map(ObjectIdentifier.init)
+    private func viewportBinding(for pane: ComparisonPane) -> Binding<SurfaceViewport> {
+        Binding(
+            get: {
+                pane == .original ? originalViewport : resultViewport
+            },
+            set: { newViewport in
+                lastInteractedPane = pane
+                if comparisonViewportsLinked {
+                    originalViewport = newViewport
+                    resultViewport = newViewport
+                } else if pane == .original {
+                    originalViewport = newViewport
+                } else {
+                    resultViewport = newViewport
+                }
+            }
+        )
     }
 
-    private var isMaskPainting: Bool {
-        appState.resultImage != nil && appState.maskTool != .pan
+    private func markInteraction(_ pane: ComparisonPane) {
+        lastInteractedPane = pane
     }
 
-    private var maskEditingConfiguration: MaskEditingConfiguration? {
-        guard appState.resultImage != nil else { return nil }
-        return MaskEditingConfiguration(
-            tool: appState.maskTool,
-            brushDiameter: CGFloat(appState.brushDiameter),
-            originalImage: appState.originalImage
-        ) { points, radius in
-            appState.applyMaskStroke(normalizedPoints: points, radius: radius)
+    private func toggleComparisonViewports() {
+        if comparisonViewportsLinked {
+            comparisonViewportsLinked = false
+            return
         }
+
+        let sourceViewport = lastInteractedPane == .original
+            ? originalViewport
+            : resultViewport
+        originalViewport = sourceViewport
+        resultViewport = sourceViewport
+        comparisonViewportsLinked = true
     }
 }
 
 private struct WorkspaceTopBar: View {
     @ObservedObject var appState: AppState
+    let comparisonViewportsLinked: Bool
+    let onToggleComparisonViewports: () -> Void
+    @State private var showsLayers = false
+    @State private var showsCanvasSize = false
 
     var body: some View {
         HStack(spacing: 8) {
+            Menu {
+                Button {
+                    appState.addObjectLayerPicker()
+                } label: {
+                    Label("Добавить объект…", systemImage: "photo.badge.plus")
+                }
+
+                Button {
+                    appState.addBackgroundLayerPicker()
+                } label: {
+                    Label("Добавить фон…", systemImage: "rectangle.inset.filled")
+                }
+            } label: {
+                Label("Добавить", systemImage: "plus")
+            }
+            .help("Добавить изображение в композицию")
+
+            Button {
+                showsLayers.toggle()
+            } label: {
+                Label("Слои \(appState.layers.count)", systemImage: "square.3.layers.3d")
+            }
+            .popover(isPresented: $showsLayers, arrowEdge: .top) {
+                LayerListPopover(appState: appState)
+            }
+            .help("Слои композиции")
+
+            Button {
+                showsCanvasSize.toggle()
+            } label: {
+                Label("Холст", systemImage: "aspectratio")
+            }
+            .popover(isPresented: $showsCanvasSize, arrowEdge: .top) {
+                CanvasSizePopover(appState: appState)
+            }
+            .help("Размер холста: \(canvasSizeTitle) px")
+
             Menu {
                 previewButton(.original, shortcut: "Tab+1")
                 previewButton(.result, shortcut: "Tab+2")
@@ -218,6 +343,32 @@ private struct WorkspaceTopBar: View {
             }
             .help("Режим просмотра")
 
+            if appState.previewMode == .comparison {
+                Button(action: onToggleComparisonViewports) {
+                    Image(systemName: "link")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(
+                            comparisonViewportsLinked ? Color.white : Color.primary
+                        )
+                        .frame(width: 28, height: 28)
+                        .background(
+                            comparisonViewportsLinked ? Color.accentColor : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(
+                    comparisonViewportsLinked
+                        ? "Отключить синхронизацию масштаба и положения"
+                        : "Синхронизировать масштаб и положение"
+                )
+                .accessibilityLabel(
+                    comparisonViewportsLinked
+                        ? "Отключить синхронизацию"
+                        : "Включить синхронизацию"
+                )
+            }
+
             Menu {
                 ForEach(AppState.PreviewBackground.allCases) { background in
                     Button {
@@ -225,7 +376,9 @@ private struct WorkspaceTopBar: View {
                     } label: {
                         Label(
                             background.title,
-                            systemImage: appState.previewBackground == background ? "checkmark" : backgroundSymbol(background)
+                            systemImage: appState.previewBackground == background
+                                ? "checkmark"
+                                : backgroundSymbol(background)
                         )
                     }
                 }
@@ -246,8 +399,8 @@ private struct WorkspaceTopBar: View {
             } label: {
                 Label("Сохранить", systemImage: "square.and.arrow.down")
             }
-            .disabled(appState.resultImage == nil || appState.isProcessing)
-            .help("Сохранить PNG (⌘S)")
+            .disabled(appState.layers.isEmpty || appState.isProcessing)
+            .help("Сохранить композицию в PNG (⌘S)")
 
             Button {
                 appState.clear()
@@ -255,14 +408,14 @@ private struct WorkspaceTopBar: View {
                 Image(systemName: "trash")
                     .frame(width: 18)
             }
-            .help("Закрыть изображение")
+            .help("Закрыть композицию")
 
             Button {
                 appState.removeBackground()
             } label: {
                 Label("Обработать снова", systemImage: "arrow.clockwise")
             }
-            .disabled(appState.isProcessing)
+            .disabled(selectedLayer?.kind != .object || appState.isSelectedLayerProcessing)
         }
         .controlSize(.large)
         .padding(8)
@@ -273,12 +426,21 @@ private struct WorkspaceTopBar: View {
         }
     }
 
+    private var selectedLayer: AppState.ImageLayer? {
+        guard let selectedLayerID = appState.selectedLayerID else { return nil }
+        return appState.layers.first(where: { $0.id == selectedLayerID })
+    }
+
     private var previewSymbol: String {
         switch appState.previewMode {
         case .original: "photo"
         case .result: "wand.and.stars"
         case .comparison: "rectangle.split.2x1"
         }
+    }
+
+    private var canvasSizeTitle: String {
+        "\(Int(appState.canvasSize.width)) × \(Int(appState.canvasSize.height))"
     }
 
     private func previewButton(_ mode: AppState.PreviewMode, shortcut: String) -> some View {
@@ -305,17 +467,361 @@ private struct WorkspaceTopBar: View {
     }
 }
 
+private struct CanvasSizePopover: View {
+    @ObservedObject var appState: AppState
+    @State private var widthText: String
+    @State private var heightText: String
+    @State private var padding: Double = 48
+
+    init(appState: AppState) {
+        self.appState = appState
+        _widthText = State(initialValue: String(Int(appState.canvasSize.width)))
+        _heightText = State(initialValue: String(Int(appState.canvasSize.height)))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Размер холста")
+                    .font(.headline)
+                Text("Он определяет размер итогового PNG")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                dimensionField(title: "Ширина", text: $widthText)
+                Image(systemName: "multiply")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                dimensionField(title: "Высота", text: $heightText)
+                Text("px")
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    applyCustomSize()
+                } label: {
+                    Text("Применить")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canApplyCustomSize)
+
+                Menu {
+                    presetButton("Квадрат", width: 1_080, height: 1_080)
+                    presetButton("Альбомный", width: 1_920, height: 1_080)
+                    presetButton("Портрет", width: 1_080, height: 1_350)
+                    presetButton("История / обои", width: 1_080, height: 1_920)
+                    presetButton("Горизонтальный пост", width: 1_200, height: 628)
+                    Divider()
+                    presetButton("4K", width: 3_840, height: 2_160)
+                } label: {
+                    Label("Форматы", systemImage: "rectangle.3.group")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Text("Поля при автоподгонке")
+                        .font(.callout)
+                    Spacer()
+                    Text("\(Int(padding)) px")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(value: $padding, in: 0...512, step: 1)
+
+                Button {
+                    appState.fitCanvasToVisibleLayers(padding: CGFloat(padding))
+                } label: {
+                    Label(
+                        "По всем видимым слоям",
+                        systemImage: "arrow.up.left.and.arrow.down.right"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .help("Расширить или уменьшить холст под видимые слои")
+            }
+
+            Button {
+                appState.resetCanvasSize()
+            } label: {
+                Label(
+                    "Вернуть исходный — \(initialSizeTitle)",
+                    systemImage: "arrow.counterclockwise"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(appState.canvasSize == appState.initialCanvasSize)
+
+            Text("При ручном изменении холст расширяется или обрезается относительно центра.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 360)
+        .onAppear {
+            synchronizeFields()
+        }
+        .onChange(of: appState.documentID) { _, _ in
+            synchronizeFields()
+        }
+    }
+
+    private var parsedWidth: Int? {
+        Int(widthText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private var parsedHeight: Int? {
+        Int(heightText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private var canApplyCustomSize: Bool {
+        guard let parsedWidth, let parsedHeight else { return false }
+        return (1...32_768).contains(parsedWidth) &&
+            (1...32_768).contains(parsedHeight)
+    }
+
+    private var initialSizeTitle: String {
+        "\(Int(appState.initialCanvasSize.width)) × \(Int(appState.initialCanvasSize.height))"
+    }
+
+    private func dimensionField(
+        title: String,
+        text: Binding<String>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField(title, text: text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 108)
+                .onSubmit {
+                    applyCustomSize()
+                }
+        }
+    }
+
+    private func presetButton(
+        _ title: String,
+        width: Int,
+        height: Int
+    ) -> some View {
+        Button("\(title) — \(width) × \(height)") {
+            appState.resizeCanvas(to: CGSize(width: width, height: height))
+        }
+    }
+
+    private func applyCustomSize() {
+        guard canApplyCustomSize,
+              let parsedWidth,
+              let parsedHeight else {
+            return
+        }
+        appState.resizeCanvas(to: CGSize(width: parsedWidth, height: parsedHeight))
+    }
+
+    private func synchronizeFields() {
+        widthText = String(Int(appState.canvasSize.width))
+        heightText = String(Int(appState.canvasSize.height))
+    }
+}
+
+private struct LayerListPopover: View {
+    @ObservedObject var appState: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Слои")
+                    .font(.headline)
+                Spacer()
+                Text("\(appState.layers.count)")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 5) {
+                    ForEach(Array(appState.layers.reversed())) { layer in
+                        layerRow(layer)
+                    }
+                }
+                .padding(8)
+            }
+            .frame(height: min(CGFloat(appState.layers.count) * 62 + 16, 330))
+
+            Divider()
+
+            if let selectedLayer {
+                VStack(spacing: 9) {
+                    HStack {
+                        Text("Масштаб")
+                            .foregroundStyle(.secondary)
+                        Slider(
+                            value: scaleBinding(for: selectedLayer.id),
+                            in: Double(AppState.minimumLayerScale)...Double(AppState.maximumLayerScale)
+                        )
+                        Text("\(Int(selectedLayer.scale * 100))%")
+                            .frame(width: 46, alignment: .trailing)
+                            .monospacedDigit()
+                    }
+
+                    HStack(spacing: 6) {
+                        layerAction(
+                            symbol: "arrow.down",
+                            help: "Опустить слой",
+                            isDisabled: selectedIndex == 0
+                        ) {
+                            appState.moveSelectedLayerDown()
+                        }
+
+                        layerAction(
+                            symbol: "arrow.up",
+                            help: "Поднять слой",
+                            isDisabled: selectedIndex == appState.layers.count - 1
+                        ) {
+                            appState.moveSelectedLayerUp()
+                        }
+
+                        layerAction(
+                            symbol: "plus.square.on.square",
+                            help: "Дублировать слой"
+                        ) {
+                            appState.duplicateSelectedLayer()
+                        }
+
+                        Spacer()
+
+                        layerAction(
+                            symbol: "trash",
+                            help: "Удалить слой",
+                            role: .destructive
+                        ) {
+                            appState.removeSelectedLayer()
+                        }
+                    }
+                }
+                .padding(12)
+            }
+        }
+        .frame(width: 330)
+    }
+
+    private var selectedLayer: AppState.ImageLayer? {
+        guard let selectedLayerID = appState.selectedLayerID else { return nil }
+        return appState.layers.first(where: { $0.id == selectedLayerID })
+    }
+
+    private var selectedIndex: Int? {
+        guard let selectedLayerID = appState.selectedLayerID else { return nil }
+        return appState.layers.firstIndex(where: { $0.id == selectedLayerID })
+    }
+
+    private func layerRow(_ layer: AppState.ImageLayer) -> some View {
+        HStack(spacing: 9) {
+            Button {
+                appState.setLayerVisibility(layer.id, isVisible: !layer.isVisible)
+            } label: {
+                Image(systemName: layer.isVisible ? "eye" : "eye.slash")
+                    .frame(width: 18)
+                    .foregroundStyle(layer.isVisible ? .primary : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help(layer.isVisible ? "Скрыть слой" : "Показать слой")
+
+            ZStack {
+                CheckerboardView(squareSize: 6)
+                Image(nsImage: layer.resultImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .padding(2)
+            }
+            .frame(width: 42, height: 42)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(.secondary.opacity(0.18))
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(layer.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                Text(layer.kind.title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 4)
+
+            if layer.isProcessing {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            layer.id == appState.selectedLayerID
+                ? Color.accentColor.opacity(0.16)
+                : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            appState.selectLayer(layer.id)
+        }
+        .opacity(layer.isVisible ? 1 : 0.58)
+    }
+
+    private func scaleBinding(for id: UUID) -> Binding<Double> {
+        Binding(
+            get: {
+                Double(appState.layers.first(where: { $0.id == id })?.scale ?? 1)
+            },
+            set: {
+                appState.setLayerScale(id, scale: CGFloat($0))
+            }
+        )
+    }
+
+    private func layerAction(
+        symbol: String,
+        help: String,
+        isDisabled: Bool = false,
+        role: ButtonRole? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            Image(systemName: symbol)
+                .frame(width: 22, height: 22)
+        }
+        .buttonStyle(.borderless)
+        .disabled(isDisabled)
+        .help(help)
+    }
+}
+
 private struct MaskToolPalette: View {
     @ObservedObject var appState: AppState
     @State private var showsBrushSize = false
-
-    private var canEdit: Bool {
-        appState.resultImage != nil && !appState.isProcessing
-    }
-
-    private var maskToolIsSelected: Bool {
-        appState.maskTool == .erase || appState.maskTool == .restore
-    }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -326,7 +832,7 @@ private struct MaskToolPalette: View {
             }
             .buttonStyle(.plain)
             .disabled(!canEdit)
-            .help("Перемещение (V)")
+            .help("Выбор и перемещение слоя (V)")
 
             Menu {
                 Button {
@@ -391,7 +897,16 @@ private struct MaskToolPalette: View {
             }
             .buttonStyle(.plain)
             .disabled(!appState.canUndoMaskEdit)
-            .help("Отменить последнее изменение (⌘Z)")
+            .help("Отменить изменение выбранного слоя (⌘Z)")
+
+            Button {
+                appState.redoLastMaskEdit()
+            } label: {
+                paletteIcon("arrow.uturn.forward", selected: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(!appState.canRedoMaskEdit)
+            .help("Повторить изменение выбранного слоя (⇧⌘Z)")
 
             Button {
                 appState.resetMaskEdits()
@@ -400,7 +915,7 @@ private struct MaskToolPalette: View {
             }
             .buttonStyle(.plain)
             .disabled(!appState.hasManualMaskEdits)
-            .help("Сбросить все правки маски")
+            .help("Сбросить правки маски выбранного слоя")
 
             Spacer(minLength: 0)
         }
@@ -413,319 +928,474 @@ private struct MaskToolPalette: View {
         }
     }
 
+    private var selectedLayer: AppState.ImageLayer? {
+        guard let selectedLayerID = appState.selectedLayerID else { return nil }
+        return appState.layers.first(where: { $0.id == selectedLayerID })
+    }
+
+    private var canEdit: Bool {
+        guard let selectedLayer else { return false }
+        return selectedLayer.isVisible && !selectedLayer.isProcessing
+    }
+
+    private var maskToolIsSelected: Bool {
+        appState.maskTool == .erase || appState.maskTool == .restore
+    }
+
     private func paletteIcon(_ symbol: String, selected: Bool) -> some View {
         Image(systemName: symbol)
-            .font(.system(size: 15, weight: .medium))
+            .font(.system(size: 16, weight: .medium))
             .foregroundStyle(selected ? Color.white : Color.primary)
             .frame(width: 34, height: 34)
-            .background(selected ? Color.accentColor : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(
+                selected ? Color.accentColor : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
             .contentShape(Rectangle())
     }
 }
 
-private struct MaskEditingConfiguration {
-    let tool: AppState.MaskTool
-    let brushDiameter: CGFloat
-    let originalImage: NSImage?
-    let applyStroke: ([CGPoint], CGFloat) -> Void
+private struct SelectedLayerInspector: View {
+    @ObservedObject var appState: AppState
+    let layerID: UUID
+
+    var body: some View {
+        if let layer = currentLayer,
+           let pixelImage = layer.originalImage.pixelCGImage {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 9) {
+                    Image(systemName: layer.kind == .object ? "photo" : "rectangle.inset.filled")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(.tint)
+                        .frame(width: 28, height: 28)
+                        .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7))
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(layer.sourceURL?.lastPathComponent ?? layer.name)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(layer.kind.title)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        appState.deselectLayer()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Снять выделение (Esc)")
+                }
+
+                Divider()
+
+                HStack {
+                    Text("Размер")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "link")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Пропорции сохраняются")
+                }
+
+                HStack(spacing: 6) {
+                    numericField(
+                        title: "Ш",
+                        value: layerWidthBinding(baseWidth: CGFloat(pixelImage.width)),
+                        suffix: "px"
+                    )
+                    Text("×")
+                        .foregroundStyle(.secondary)
+                    numericField(
+                        title: "В",
+                        value: layerHeightBinding(baseHeight: CGFloat(pixelImage.height)),
+                        suffix: "px"
+                    )
+                }
+
+                HStack(spacing: 6) {
+                    numericField(
+                        title: "X",
+                        value: layerPositionXBinding,
+                        suffix: "px"
+                    )
+                    numericField(
+                        title: "Y",
+                        value: layerPositionYBinding,
+                        suffix: "px"
+                    )
+                }
+
+                HStack(spacing: 8) {
+                    Text("Масштаб")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    TextField(
+                        "",
+                        value: layerScaleBinding,
+                        format: .number.precision(.fractionLength(0))
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 64)
+                    Text("%")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .controlSize(.small)
+            .padding(12)
+            .frame(width: 286)
+            .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(.secondary.opacity(0.22))
+            }
+            .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+        }
+    }
+
+    private var currentLayer: AppState.ImageLayer? {
+        appState.layers.first(where: { $0.id == layerID })
+    }
+
+    private var layerScaleBinding: Binding<Double> {
+        Binding(
+            get: {
+                Double((currentLayer?.scale ?? 1) * 100)
+            },
+            set: { percentage in
+                guard percentage.isFinite else { return }
+                appState.setLayerScale(layerID, scale: CGFloat(percentage / 100))
+            }
+        )
+    }
+
+    private var layerPositionXBinding: Binding<Double> {
+        Binding(
+            get: {
+                Double(appState.canvasSize.width / 2 + (currentLayer?.offset.width ?? 0))
+            },
+            set: { position in
+                guard position.isFinite, let layer = currentLayer else { return }
+                appState.moveLayer(
+                    layerID,
+                    to: CGSize(
+                        width: CGFloat(position) - appState.canvasSize.width / 2,
+                        height: layer.offset.height
+                    )
+                )
+            }
+        )
+    }
+
+    private var layerPositionYBinding: Binding<Double> {
+        Binding(
+            get: {
+                Double(appState.canvasSize.height / 2 + (currentLayer?.offset.height ?? 0))
+            },
+            set: { position in
+                guard position.isFinite, let layer = currentLayer else { return }
+                appState.moveLayer(
+                    layerID,
+                    to: CGSize(
+                        width: layer.offset.width,
+                        height: CGFloat(position) - appState.canvasSize.height / 2
+                    )
+                )
+            }
+        )
+    }
+
+    private func layerWidthBinding(baseWidth: CGFloat) -> Binding<Double> {
+        Binding(
+            get: {
+                Double(baseWidth * (currentLayer?.scale ?? 1))
+            },
+            set: { width in
+                guard width.isFinite, width > 0, baseWidth > 0 else { return }
+                appState.setLayerScale(layerID, scale: CGFloat(width) / baseWidth)
+            }
+        )
+    }
+
+    private func layerHeightBinding(baseHeight: CGFloat) -> Binding<Double> {
+        Binding(
+            get: {
+                Double(baseHeight * (currentLayer?.scale ?? 1))
+            },
+            set: { height in
+                guard height.isFinite, height > 0, baseHeight > 0 else { return }
+                appState.setLayerScale(layerID, scale: CGFloat(height) / baseHeight)
+            }
+        )
+    }
+
+    private func numericField(
+        title: String,
+        value: Binding<Double>,
+        suffix: String
+    ) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField(
+                "",
+                value: value,
+                format: .number.precision(.fractionLength(0))
+            )
+            .textFieldStyle(.roundedBorder)
+            .multilineTextAlignment(.trailing)
+            .frame(width: 66)
+            Text(suffix)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
 }
 
-private struct PreviewSurface: View {
-    let image: NSImage?
+private struct CompositionSurface: View {
+    @ObservedObject var appState: AppState
     let background: AppState.PreviewBackground
+    let useOriginals: Bool
+    let allowsLayerEditing: Bool
+    let allowsMaskPainting: Bool
     let label: String
-    let viewportIdentity: ObjectIdentifier?
-    let maskEditing: MaskEditingConfiguration?
+    @Binding var viewport: SurfaceViewport
+    let onInteraction: () -> Void
 
-    @State private var zoomScale: CGFloat = 1
-    @State private var panOffset: CGSize = .zero
+    @State private var pinchStartZoom: CGFloat?
+    @State private var draggingLayerID: UUID?
+    @State private var draggingLayerStartOffset: CGSize?
+    @State private var activeResize: LayerResizeState?
     @State private var activeStrokeLocations: [CGPoint] = []
     @State private var activeStrokePoints: [CGPoint] = []
     @State private var brushCursorLocation: CGPoint?
-    @GestureState private var gestureMagnification: CGFloat = 1
-    @GestureState private var gestureTranslation: CGSize = .zero
 
-    private let minimumZoom: CGFloat = 0.25
+    private let minimumZoom: CGFloat = 0.1
     private let maximumZoom: CGFloat = 8
-    private let minimumCanvasOverscroll: CGFloat = 72
-    private let maximumCanvasOverscroll: CGFloat = 180
-    private let canvasOverscrollRatio: CGFloat = 0.18
-
-    init(
-        image: NSImage?,
-        background: AppState.PreviewBackground,
-        label: String,
-        viewportIdentity: ObjectIdentifier? = nil,
-        maskEditing: MaskEditingConfiguration? = nil
-    ) {
-        self.image = image
-        self.background = background
-        self.label = label
-        self.viewportIdentity = viewportIdentity
-        self.maskEditing = maskEditing
-    }
+    private let canvasOverscrollRatio: CGFloat = 0.35
+    private let minimumCanvasOverscroll: CGFloat = 100
+    private let maximumCanvasOverscroll: CGFloat = 700
 
     var body: some View {
-        ZStack {
-            PreviewBackgroundView(style: background)
-
-            if let image {
-                interactiveImage(image)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(alignment: .topLeading) {
-            if !label.isEmpty {
-                Text(label)
-                    .font(.caption.weight(.medium))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(.ultraThickMaterial, in: Capsule())
-                    .padding(12)
-            }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if image != nil {
-                zoomControls
-                    .padding(12)
-            }
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.secondary.opacity(0.2))
-        }
-        .onChange(of: viewportIdentity) { _, _ in
-            resetViewport()
-        }
-        .onChange(of: isPaintingMask) { _, _ in
-            cancelActiveStroke()
-            resetViewport()
-        }
-    }
-
-    private var visibleZoomScale: CGFloat {
-        clampedZoom(zoomScale * gestureMagnification)
-    }
-
-    private var isPaintingMask: Bool {
-        guard let tool = maskEditing?.tool else { return false }
-        return tool == .erase || tool == .restore
-    }
-
-    private var brushColor: Color {
-        maskEditing?.tool == .restore ? .green : .red
-    }
-
-    private var zoomControls: some View {
-        HStack(spacing: 3) {
-            Button {
-                changeZoom(by: 1 / 1.25)
-            } label: {
-                Image(systemName: "minus")
-                    .frame(width: 24, height: 24)
-            }
-            .help("Уменьшить")
-
-            Button {
-                resetViewport()
-            } label: {
-                Text("\(Int((zoomScale * 100).rounded()))%")
-                    .monospacedDigit()
-                    .frame(minWidth: 46)
-            }
-            .help("Вписать изображение")
-
-            Button {
-                changeZoom(by: 1.25)
-            } label: {
-                Image(systemName: "plus")
-                    .frame(width: 24, height: 24)
-            }
-            .help("Увеличить")
-
-            Divider()
-                .frame(height: 18)
-                .padding(.horizontal, 3)
-
-            Button {
-                resetViewport()
-            } label: {
-                Image(systemName: "arrow.down.right.and.arrow.up.left")
-                    .frame(width: 24, height: 24)
-            }
-            .help("Вернуть по центру")
-        }
-        .padding(5)
-        .buttonStyle(.plain)
-        .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(.secondary.opacity(0.2))
-        }
-    }
-
-    private func interactiveImage(_ image: NSImage) -> some View {
         GeometryReader { geometry in
-            let viewportSize = CGSize(
-                width: max(geometry.size.width - 48, 1),
-                height: max(geometry.size.height - 48, 1)
-            )
-            let fittedSize = aspectFitSize(image.size, in: viewportSize)
-            let proposedOffset = CGSize(
-                width: panOffset.width + gestureTranslation.width,
-                height: panOffset.height + gestureTranslation.height
-            )
-            let displayedOffset = constrainedOffset(
-                proposedOffset,
-                fittedSize: fittedSize,
-                viewportSize: viewportSize,
-                scale: visibleZoomScale
-            )
-            let renderedSize = CGSize(
-                width: fittedSize.width * visibleZoomScale,
-                height: fittedSize.height * visibleZoomScale
-            )
-            let imageRect = CGRect(
-                x: geometry.size.width / 2 + displayedOffset.width - renderedSize.width / 2,
-                y: geometry.size.height / 2 + displayedOffset.height - renderedSize.height / 2,
-                width: renderedSize.width,
-                height: renderedSize.height
-            )
+            let layout = makeLayout(in: geometry.size)
 
             ZStack {
-                if maskEditing?.tool == .restore,
-                   let originalImage = maskEditing?.originalImage {
-                    positionedImage(
-                        originalImage,
-                        fittedSize: fittedSize,
-                        displayedOffset: displayedOffset,
-                        geometrySize: geometry.size
-                    )
-                    .opacity(0.22)
-                }
+                Color(nsColor: .controlBackgroundColor)
 
-                positionedImage(
-                    image,
-                    fittedSize: fittedSize,
-                    displayedOffset: displayedOffset,
-                    geometrySize: geometry.size
-                )
+                compositionCanvas(layout: layout)
+
+                if allowsLayerEditing {
+                    selectionOverlay(layout: layout)
+                        .allowsHitTesting(false)
+                }
 
                 if isPaintingMask {
                     brushOverlay
                         .allowsHitTesting(false)
                 }
 
-                TrackpadPanCapture { translation in
-                    let proposed = CGSize(
-                        width: panOffset.width + translation.width,
-                        height: panOffset.height + translation.height
-                    )
-                    panOffset = constrainedOffset(
-                        proposed,
-                        fittedSize: fittedSize,
-                        viewportSize: viewportSize,
-                        scale: zoomScale
-                    )
+                if !label.isEmpty {
+                    VStack {
+                        HStack {
+                            Text(label)
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(.ultraThickMaterial, in: Capsule())
+                            Spacer()
+                        }
+                        Spacer()
+                    }
+                    .padding(12)
+                    .allowsHitTesting(false)
                 }
+
+                zoomControls
+
+                TrackpadPanCapture { translation in
+                    onInteraction()
+                    let proposed = CGSize(
+                        width: layout.canvasOffset.width + translation.width,
+                        height: layout.canvasOffset.height + translation.height
+                    )
+                    let constrainedOffset = constrainedCameraOffset(
+                        proposed,
+                        renderedCanvasSize: layout.renderedCanvasSize,
+                        viewportSize: layout.viewportSize
+                    )
+                    guard layout.projection > 0 else { return }
+                    var updatedViewport = viewport
+                    updatedViewport.centerOffset = CGSize(
+                        width: constrainedOffset.width / layout.projection,
+                        height: constrainedOffset.height / layout.projection
+                    )
+                    viewport = updatedViewport
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .allowsHitTesting(false)
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
             .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: isPaintingMask ? 0 : 1)
-                        .updating($gestureTranslation) { value, state, _ in
-                            if !isPaintingMask {
-                                state = value.translation
-                            }
+            .gesture(surfaceDragGesture(layout: layout))
+            .simultaneousGesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        onInteraction()
+                        if pinchStartZoom == nil {
+                            pinchStartZoom = viewport.zoomScale
                         }
-                        .onChanged { value in
-                            if isPaintingMask {
-                                appendBrushPoint(value.location, in: imageRect)
-                            }
-                        }
-                        .onEnded { value in
-                            if isPaintingMask {
-                                appendBrushPoint(value.location, in: imageRect)
-                                finishBrushStroke(on: image, imageRect: imageRect)
-                            } else {
-                                let proposed = CGSize(
-                                    width: panOffset.width + value.translation.width,
-                                    height: panOffset.height + value.translation.height
-                                )
-                                panOffset = constrainedOffset(
-                                    proposed,
-                                    fittedSize: fittedSize,
-                                    viewportSize: viewportSize,
-                                    scale: zoomScale
-                                )
-                            }
-                        }
-                )
-                .simultaneousGesture(
-                    MagnificationGesture()
-                        .updating($gestureMagnification) { value, state, _ in
-                            state = value
-                        }
-                        .onEnded { value in
-                            let newScale = clampedZoom(zoomScale * value)
-                            zoomScale = newScale
-                            panOffset = constrainedOffset(
-                                panOffset,
-                                fittedSize: fittedSize,
-                                viewportSize: viewportSize,
-                                scale: newScale
-                            )
-                        }
-                )
-                .onTapGesture(count: 2) {
-                    if !isPaintingMask {
-                        resetViewport()
+                        var updatedViewport = viewport
+                        updatedViewport.zoomScale = clampedZoom(
+                            (pinchStartZoom ?? viewport.zoomScale) * value
+                        )
+                        viewport = updatedViewport
                     }
-                }
-                .onContinuousHover { phase in
-                    guard isPaintingMask else {
-                        brushCursorLocation = nil
-                        return
+                    .onEnded { _ in
+                        pinchStartZoom = nil
                     }
-
-                    switch phase {
-                    case .active(let location):
-                        brushCursorLocation = imageRect.contains(location) ? location : nil
-                    case .ended:
-                        brushCursorLocation = nil
-                    }
-                }
-                .animation(.snappy(duration: 0.2), value: zoomScale)
-                .animation(.snappy(duration: 0.2), value: panOffset)
+            )
+            .onTapGesture(count: 2) {
+                guard appState.maskTool == .pan else { return }
+                onInteraction()
+                resetViewport()
+            }
+            .onContinuousHover { phase in
+                updateBrushCursor(for: phase, layout: layout)
+            }
         }
-        .clipped()
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.secondary.opacity(0.18))
+        }
     }
 
-    private func positionedImage(
-        _ image: NSImage,
-        fittedSize: CGSize,
-        displayedOffset: CGSize,
-        geometrySize: CGSize
-    ) -> some View {
-        Image(nsImage: image)
-            .resizable()
-            .interpolation(.high)
-            .antialiased(true)
-            .frame(width: fittedSize.width, height: fittedSize.height)
-            .scaleEffect(visibleZoomScale)
-            .position(
-                x: geometrySize.width / 2 + displayedOffset.width,
-                y: geometrySize.height / 2 + displayedOffset.height
+    private var visibleZoomScale: CGFloat {
+        clampedZoom(viewport.zoomScale)
+    }
+
+    private var selectedLayer: AppState.ImageLayer? {
+        guard let selectedLayerID = appState.selectedLayerID else { return nil }
+        return appState.layers.first(where: { $0.id == selectedLayerID })
+    }
+
+    private var isPaintingMask: Bool {
+        guard allowsMaskPainting,
+              !useOriginals,
+              appState.maskTool != .pan,
+              let selectedLayer else {
+            return false
+        }
+        return selectedLayer.isVisible && !selectedLayer.isProcessing
+    }
+
+    private var canTransformLayer: Bool {
+        allowsLayerEditing && (appState.maskTool == .pan || !allowsMaskPainting)
+    }
+
+    private var brushColor: Color {
+        appState.maskTool == .restore ? .green : .red
+    }
+
+    private func compositionCanvas(layout: SurfaceLayout) -> some View {
+        ZStack {
+            PreviewBackgroundView(style: background)
+
+            ForEach(appState.layers) { layer in
+                layerContent(layer, layout: layout)
+            }
+        }
+        .frame(
+            width: layout.renderedCanvasSize.width,
+            height: layout.renderedCanvasSize.height
+        )
+        .clipped()
+        .position(
+            x: layout.canvasRect.midX,
+            y: layout.canvasRect.midY
+        )
+    }
+
+    @ViewBuilder
+    private func layerContent(_ layer: AppState.ImageLayer, layout: SurfaceLayout) -> some View {
+        if layer.isVisible,
+           let pixelImage = (useOriginals ? layer.originalImage : layer.resultImage).pixelCGImage {
+            let renderedSize = CGSize(
+                width: CGFloat(pixelImage.width) * layer.scale * layout.projection,
+                height: CGFloat(pixelImage.height) * layer.scale * layout.projection
             )
+            let position = CGPoint(
+                x: layout.renderedCanvasSize.width / 2 + layer.offset.width * layout.projection,
+                y: layout.renderedCanvasSize.height / 2 + layer.offset.height * layout.projection
+            )
+
+            if isPaintingMask,
+               appState.maskTool == .restore,
+               layer.id == appState.selectedLayerID {
+                Image(nsImage: layer.originalImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .frame(width: renderedSize.width, height: renderedSize.height)
+                    .position(position)
+                    .opacity(0.22)
+            }
+
+            Image(nsImage: useOriginals ? layer.originalImage : layer.resultImage)
+                .resizable()
+                .interpolation(.high)
+                .antialiased(true)
+                .frame(width: renderedSize.width, height: renderedSize.height)
+                .position(position)
+
+        }
+    }
+
+    @ViewBuilder
+    private func selectionOverlay(layout: SurfaceLayout) -> some View {
+        if let selectedLayer,
+           selectedLayer.isVisible,
+           let selectionRect = layerRect(for: selectedLayer, layout: layout) {
+            Rectangle()
+                .stroke(
+                    Color.accentColor,
+                    style: StrokeStyle(lineWidth: 1.5, dash: [6, 4])
+                )
+                .frame(width: selectionRect.width, height: selectionRect.height)
+                .position(x: selectionRect.midX, y: selectionRect.midY)
+
+            if canTransformLayer, !selectedLayer.isProcessing {
+                ForEach(ResizeCorner.allCases, id: \.self) { corner in
+                    let point = corner.point(in: selectionRect)
+                    Circle()
+                        .fill(.background)
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.accentColor, lineWidth: 2)
+                        }
+                        .frame(width: 11, height: 11)
+                        .position(point)
+                }
+            }
+        }
     }
 
     private var brushOverlay: some View {
         Canvas { context, _ in
-            if let cursor = brushCursorLocation,
-               let diameter = maskEditing?.brushDiameter {
+            let diameter = CGFloat(appState.brushDiameter)
+
+            if let cursor = brushCursorLocation {
                 let cursorRect = CGRect(
                     x: cursor.x - diameter / 2,
                     y: cursor.y - diameter / 2,
@@ -739,10 +1409,7 @@ private struct PreviewSurface: View {
                 )
             }
 
-            guard !activeStrokeLocations.isEmpty,
-                  let diameter = maskEditing?.brushDiameter else {
-                return
-            }
+            guard !activeStrokeLocations.isEmpty else { return }
 
             if activeStrokeLocations.count == 1, let point = activeStrokeLocations.first {
                 let dabRect = CGRect(
@@ -751,7 +1418,10 @@ private struct PreviewSurface: View {
                     width: diameter,
                     height: diameter
                 )
-                context.fill(Path(ellipseIn: dabRect), with: .color(brushColor.opacity(0.3)))
+                context.fill(
+                    Path(ellipseIn: dabRect),
+                    with: .color(brushColor.opacity(0.3))
+                )
             } else {
                 var path = Path()
                 if let first = activeStrokeLocations.first {
@@ -762,17 +1432,250 @@ private struct PreviewSurface: View {
                     context.stroke(
                         path,
                         with: .color(brushColor.opacity(0.3)),
-                        style: StrokeStyle(lineWidth: diameter, lineCap: .round, lineJoin: .round)
+                        style: StrokeStyle(
+                            lineWidth: diameter,
+                            lineCap: .round,
+                            lineJoin: .round
+                        )
                     )
                 }
             }
         }
     }
 
-    private func appendBrushPoint(_ location: CGPoint, in imageRect: CGRect) {
-        guard imageRect.width > 0,
+    private var zoomControls: some View {
+        VStack {
+            Spacer()
+            HStack {
+                HStack(spacing: 3) {
+                    Button {
+                        changeZoom(by: 0.8)
+                    } label: {
+                        Image(systemName: "minus")
+                            .frame(width: 26, height: 26)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Отдалить")
+
+                    Text("\(Int((visibleZoomScale * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 48)
+
+                    Button {
+                        changeZoom(by: 1.25)
+                    } label: {
+                        Image(systemName: "plus")
+                            .frame(width: 26, height: 26)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Приблизить")
+
+                    Button {
+                        resetViewport()
+                    } label: {
+                        Image(systemName: "arrow.up.left.and.down.right.magnifyingglass")
+                            .frame(width: 26, height: 26)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Вписать холст")
+                }
+                .padding(5)
+                .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(.secondary.opacity(0.2))
+                }
+                Spacer()
+            }
+        }
+        .padding(12)
+    }
+
+    private func surfaceDragGesture(layout: SurfaceLayout) -> some Gesture {
+        DragGesture(minimumDistance: isPaintingMask ? 0 : 1)
+            .onChanged { value in
+                if isPaintingMask {
+                    onInteraction()
+                    appendBrushPoint(value.location, layout: layout)
+                    return
+                }
+
+                guard canTransformLayer else { return }
+                onInteraction()
+
+                if activeResize == nil,
+                   draggingLayerID == nil,
+                   let resizeCorner = resizeCorner(
+                       at: value.startLocation,
+                       layout: layout
+                   ),
+                   let resizeState = makeResizeState(for: resizeCorner) {
+                    activeResize = resizeState
+                }
+
+                if let activeResize {
+                    applyResize(
+                        activeResize,
+                        translation: value.translation,
+                        projection: layout.projection
+                    )
+                    return
+                }
+
+                if draggingLayerID == nil {
+                    guard let hitLayerID = hitTestLayer(
+                        at: value.startLocation,
+                        layout: layout
+                    ),
+                    let layer = appState.layers.first(where: { $0.id == hitLayerID }) else {
+                        appState.deselectLayer()
+                        return
+                    }
+                    appState.selectLayer(hitLayerID)
+                    draggingLayerID = hitLayerID
+                    draggingLayerStartOffset = layer.offset
+                }
+
+                guard let draggingLayerID,
+                      let draggingLayerStartOffset,
+                      layout.projection > 0 else {
+                    return
+                }
+
+                appState.moveLayer(
+                    draggingLayerID,
+                    to: CGSize(
+                        width: draggingLayerStartOffset.width + value.translation.width / layout.projection,
+                        height: draggingLayerStartOffset.height + value.translation.height / layout.projection
+                    )
+                )
+            }
+            .onEnded { value in
+                if isPaintingMask {
+                    appendBrushPoint(value.location, layout: layout)
+                    finishBrushStroke(layout: layout)
+                }
+                draggingLayerID = nil
+                draggingLayerStartOffset = nil
+                activeResize = nil
+            }
+    }
+
+    private func resizeCorner(
+        at location: CGPoint,
+        layout: SurfaceLayout
+    ) -> ResizeCorner? {
+        guard canTransformLayer,
+              let selectedLayer,
+              selectedLayer.isVisible,
+              !selectedLayer.isProcessing,
+              let selectionRect = layerRect(for: selectedLayer, layout: layout) else {
+            return nil
+        }
+
+        let hitRadius: CGFloat = 14
+        for corner in ResizeCorner.allCases {
+            let point = corner.point(in: selectionRect)
+            if abs(location.x - point.x) <= hitRadius,
+               abs(location.y - point.y) <= hitRadius {
+                return corner
+            }
+        }
+        return nil
+    }
+
+    private func makeResizeState(for corner: ResizeCorner) -> LayerResizeState? {
+        guard let selectedLayer,
+              let image = selectedLayer.originalImage.pixelCGImage else {
+            return nil
+        }
+
+        let signs = corner.signs
+        let scaledWidth = CGFloat(image.width) * selectedLayer.scale
+        let scaledHeight = CGFloat(image.height) * selectedLayer.scale
+        let halfWidth = scaledWidth / 2
+        let halfHeight = scaledHeight / 2
+        let anchor = CGPoint(
+            x: selectedLayer.offset.width - signs.x * halfWidth,
+            y: selectedLayer.offset.height - signs.y * halfHeight
+        )
+        let initialVector = CGSize(
+            width: signs.x * scaledWidth,
+            height: signs.y * scaledHeight
+        )
+
+        return LayerResizeState(
+            layerID: selectedLayer.id,
+            initialScale: selectedLayer.scale,
+            anchor: anchor,
+            initialVector: initialVector
+        )
+    }
+
+    private func applyResize(
+        _ resize: LayerResizeState,
+        translation: CGSize,
+        projection: CGFloat
+    ) {
+        guard projection > 0, resize.initialScale > 0 else { return }
+
+        let canvasTranslation = CGSize(
+            width: translation.width / projection,
+            height: translation.height / projection
+        )
+        let candidateVector = CGSize(
+            width: resize.initialVector.width + canvasTranslation.width,
+            height: resize.initialVector.height + canvasTranslation.height
+        )
+        let denominator =
+            resize.initialVector.width * resize.initialVector.width +
+            resize.initialVector.height * resize.initialVector.height
+        guard denominator > 0 else { return }
+
+        let ratio = (
+            candidateVector.width * resize.initialVector.width +
+            candidateVector.height * resize.initialVector.height
+        ) / denominator
+        guard ratio.isFinite else { return }
+
+        let newScale = min(
+            max(
+                resize.initialScale * ratio,
+                AppState.minimumLayerScale
+            ),
+            AppState.maximumLayerScale
+        )
+        let appliedRatio = newScale / resize.initialScale
+        let newOffset = CGSize(
+            width: resize.anchor.x + resize.initialVector.width * appliedRatio / 2,
+            height: resize.anchor.y + resize.initialVector.height * appliedRatio / 2
+        )
+        appState.setLayerTransform(
+            resize.layerID,
+            offset: newOffset,
+            scale: newScale
+        )
+    }
+
+    private func hitTestLayer(at location: CGPoint, layout: SurfaceLayout) -> UUID? {
+        guard layout.canvasRect.contains(location) else { return nil }
+
+        for layer in appState.layers.reversed() where layer.isVisible {
+            if let rect = layerRect(for: layer, layout: layout),
+               rect.contains(location) {
+                return layer.id
+            }
+        }
+        return nil
+    }
+
+    private func appendBrushPoint(_ location: CGPoint, layout: SurfaceLayout) {
+        guard let selectedLayer,
+              let imageRect = layerRect(for: selectedLayer, layout: layout),
+              imageRect.width > 0,
               imageRect.height > 0,
-              imageRect.contains(location) else {
+              imageRect.contains(location),
+              layout.canvasRect.contains(location) else {
             return
         }
 
@@ -789,18 +1692,23 @@ private struct PreviewSurface: View {
         ))
     }
 
-    private func finishBrushStroke(on image: NSImage, imageRect: CGRect) {
+    private func finishBrushStroke(layout: SurfaceLayout) {
         defer { cancelActiveStroke() }
 
-        guard let maskEditing,
+        guard let selectedLayer,
               !activeStrokePoints.isEmpty,
-              imageRect.width > 0 else {
+              let imageRect = layerRect(for: selectedLayer, layout: layout),
+              imageRect.width > 0,
+              let pixelImage = selectedLayer.resultImage.pixelCGImage else {
             return
         }
 
-        let pixelWidth = CGFloat(image.pixelCGImage?.width ?? max(Int(image.size.width), 1))
-        let radius = maskEditing.brushDiameter * pixelWidth / imageRect.width / 2
-        maskEditing.applyStroke(activeStrokePoints, radius)
+        let radius = CGFloat(appState.brushDiameter) *
+            CGFloat(pixelImage.width) / imageRect.width / 2
+        appState.applyMaskStroke(
+            normalizedPoints: activeStrokePoints,
+            radius: radius
+        )
     }
 
     private func cancelActiveStroke() {
@@ -809,20 +1717,89 @@ private struct PreviewSurface: View {
         brushCursorLocation = nil
     }
 
-    private func aspectFitSize(_ imageSize: CGSize, in viewportSize: CGSize) -> CGSize {
-        guard imageSize.width > 0, imageSize.height > 0 else { return viewportSize }
-        let scale = min(viewportSize.width / imageSize.width, viewportSize.height / imageSize.height)
-        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+    private func updateBrushCursor(
+        for phase: HoverPhase,
+        layout: SurfaceLayout
+    ) {
+        guard isPaintingMask,
+              let selectedLayer,
+              let imageRect = layerRect(for: selectedLayer, layout: layout) else {
+            brushCursorLocation = nil
+            return
+        }
+
+        switch phase {
+        case .active(let location):
+            brushCursorLocation = imageRect.contains(location) &&
+                layout.canvasRect.contains(location) ? location : nil
+        case .ended:
+            brushCursorLocation = nil
+        }
     }
 
-    private func constrainedOffset(
+    private func layerRect(
+        for layer: AppState.ImageLayer,
+        layout: SurfaceLayout
+    ) -> CGRect? {
+        let image = useOriginals ? layer.originalImage : layer.resultImage
+        guard let pixelImage = image.pixelCGImage else { return nil }
+
+        let width = CGFloat(pixelImage.width) * layer.scale * layout.projection
+        let height = CGFloat(pixelImage.height) * layer.scale * layout.projection
+        return CGRect(
+            x: layout.canvasRect.midX + layer.offset.width * layout.projection - width / 2,
+            y: layout.canvasRect.midY + layer.offset.height * layout.projection - height / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    private func makeLayout(in size: CGSize) -> SurfaceLayout {
+        let viewportSize = CGSize(
+            width: max(size.width - 48, 1),
+            height: max(size.height - 48, 1)
+        )
+        let width = max(appState.canvasSize.width, 1)
+        let height = max(appState.canvasSize.height, 1)
+        let fitScale = min(
+            viewportSize.width / width,
+            viewportSize.height / height
+        )
+        let projection = max(fitScale * visibleZoomScale, 0.0001)
+        let renderedCanvasSize = CGSize(
+            width: width * projection,
+            height: height * projection
+        )
+        let desiredOffset = CGSize(
+            width: viewport.centerOffset.width * projection,
+            height: viewport.centerOffset.height * projection
+        )
+        let displayedOffset = constrainedCameraOffset(
+            desiredOffset,
+            renderedCanvasSize: renderedCanvasSize,
+            viewportSize: viewportSize
+        )
+        let canvasRect = CGRect(
+            x: size.width / 2 + displayedOffset.width - renderedCanvasSize.width / 2,
+            y: size.height / 2 + displayedOffset.height - renderedCanvasSize.height / 2,
+            width: renderedCanvasSize.width,
+            height: renderedCanvasSize.height
+        )
+
+        return SurfaceLayout(
+            viewportSize: viewportSize,
+            projection: projection,
+            renderedCanvasSize: renderedCanvasSize,
+            canvasOffset: displayedOffset,
+            canvasRect: canvasRect
+        )
+    }
+
+    private func constrainedCameraOffset(
         _ proposed: CGSize,
-        fittedSize: CGSize,
-        viewportSize: CGSize,
-        scale: CGFloat
+        renderedCanvasSize: CGSize,
+        viewportSize: CGSize
     ) -> CGSize {
-        let scaledWidth = fittedSize.width * scale
-        let scaledHeight = fittedSize.height * scale
         let horizontalCanvasSpace = min(
             max(viewportSize.width * canvasOverscrollRatio, minimumCanvasOverscroll),
             maximumCanvasOverscroll
@@ -831,8 +1808,10 @@ private struct PreviewSurface: View {
             max(viewportSize.height * canvasOverscrollRatio, minimumCanvasOverscroll),
             maximumCanvasOverscroll
         )
-        let maximumX = abs(viewportSize.width - scaledWidth) / 2 + horizontalCanvasSpace
-        let maximumY = abs(viewportSize.height - scaledHeight) / 2 + verticalCanvasSpace
+        let maximumX = abs(viewportSize.width - renderedCanvasSize.width) / 2 +
+            horizontalCanvasSpace
+        let maximumY = abs(viewportSize.height - renderedCanvasSize.height) / 2 +
+            verticalCanvasSpace
 
         return CGSize(
             width: min(max(proposed.width, -maximumX), maximumX),
@@ -845,16 +1824,73 @@ private struct PreviewSurface: View {
     }
 
     private func changeZoom(by multiplier: CGFloat) {
+        onInteraction()
         withAnimation(.snappy(duration: 0.2)) {
-            zoomScale = clampedZoom(zoomScale * multiplier)
+            var updatedViewport = viewport
+            updatedViewport.zoomScale = clampedZoom(
+                viewport.zoomScale * multiplier
+            )
+            viewport = updatedViewport
         }
     }
 
-    private func resetViewport() {
-        withAnimation(.snappy(duration: 0.2)) {
-            zoomScale = 1
-            panOffset = .zero
+    private func resetViewport(animated: Bool = true) {
+        let changes = {
+            onInteraction()
+            viewport = SurfaceViewport()
         }
+
+        if animated {
+            withAnimation(.snappy(duration: 0.2)) {
+                changes()
+            }
+        } else {
+            changes()
+        }
+    }
+
+    private enum ResizeCorner: CaseIterable, Hashable {
+        case topLeft
+        case topRight
+        case bottomLeft
+        case bottomRight
+
+        var signs: CGPoint {
+            switch self {
+            case .topLeft: CGPoint(x: -1, y: -1)
+            case .topRight: CGPoint(x: 1, y: -1)
+            case .bottomLeft: CGPoint(x: -1, y: 1)
+            case .bottomRight: CGPoint(x: 1, y: 1)
+            }
+        }
+
+        func point(in rect: CGRect) -> CGPoint {
+            switch self {
+            case .topLeft:
+                CGPoint(x: rect.minX, y: rect.minY)
+            case .topRight:
+                CGPoint(x: rect.maxX, y: rect.minY)
+            case .bottomLeft:
+                CGPoint(x: rect.minX, y: rect.maxY)
+            case .bottomRight:
+                CGPoint(x: rect.maxX, y: rect.maxY)
+            }
+        }
+    }
+
+    private struct LayerResizeState {
+        let layerID: UUID
+        let initialScale: CGFloat
+        let anchor: CGPoint
+        let initialVector: CGSize
+    }
+
+    private struct SurfaceLayout {
+        let viewportSize: CGSize
+        let projection: CGFloat
+        let renderedCanvasSize: CGSize
+        let canvasOffset: CGSize
+        let canvasRect: CGRect
     }
 }
 
@@ -920,24 +1956,29 @@ private struct TrackpadPanCapture: NSViewRepresentable {
             NSEvent.removeMonitor(eventMonitor)
             self.eventMonitor = nil
         }
-
     }
 }
 
 private struct WorkspaceKeyboardShortcutCapture: NSViewRepresentable {
     let canEditMask: Bool
     let canUndoMaskEdit: Bool
+    let canRedoMaskEdit: Bool
     let selectTool: (AppState.MaskTool) -> Void
     let selectPreview: (AppState.PreviewMode) -> Void
     let undoMaskEdit: () -> Void
+    let redoMaskEdit: () -> Void
+    let deselectLayer: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             canEditMask: canEditMask,
             canUndoMaskEdit: canUndoMaskEdit,
+            canRedoMaskEdit: canRedoMaskEdit,
             selectTool: selectTool,
             selectPreview: selectPreview,
-            undoMaskEdit: undoMaskEdit
+            undoMaskEdit: undoMaskEdit,
+            redoMaskEdit: redoMaskEdit,
+            deselectLayer: deselectLayer
         )
     }
 
@@ -952,9 +1993,12 @@ private struct WorkspaceKeyboardShortcutCapture: NSViewRepresentable {
         context.coordinator.view = nsView
         context.coordinator.canEditMask = canEditMask
         context.coordinator.canUndoMaskEdit = canUndoMaskEdit
+        context.coordinator.canRedoMaskEdit = canRedoMaskEdit
         context.coordinator.selectTool = selectTool
         context.coordinator.selectPreview = selectPreview
         context.coordinator.undoMaskEdit = undoMaskEdit
+        context.coordinator.redoMaskEdit = redoMaskEdit
+        context.coordinator.deselectLayer = deselectLayer
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -966,9 +2010,12 @@ private struct WorkspaceKeyboardShortcutCapture: NSViewRepresentable {
         weak var view: NSView?
         var canEditMask: Bool
         var canUndoMaskEdit: Bool
+        var canRedoMaskEdit: Bool
         var selectTool: (AppState.MaskTool) -> Void
         var selectPreview: (AppState.PreviewMode) -> Void
         var undoMaskEdit: () -> Void
+        var redoMaskEdit: () -> Void
+        var deselectLayer: () -> Void
 
         private var eventMonitor: Any?
         private var tabIsHeld = false
@@ -976,15 +2023,21 @@ private struct WorkspaceKeyboardShortcutCapture: NSViewRepresentable {
         init(
             canEditMask: Bool,
             canUndoMaskEdit: Bool,
+            canRedoMaskEdit: Bool,
             selectTool: @escaping (AppState.MaskTool) -> Void,
             selectPreview: @escaping (AppState.PreviewMode) -> Void,
-            undoMaskEdit: @escaping () -> Void
+            undoMaskEdit: @escaping () -> Void,
+            redoMaskEdit: @escaping () -> Void,
+            deselectLayer: @escaping () -> Void
         ) {
             self.canEditMask = canEditMask
             self.canUndoMaskEdit = canUndoMaskEdit
+            self.canRedoMaskEdit = canRedoMaskEdit
             self.selectTool = selectTool
             self.selectPreview = selectPreview
             self.undoMaskEdit = undoMaskEdit
+            self.redoMaskEdit = redoMaskEdit
+            self.deselectLayer = deselectLayer
         }
 
         func installMonitor() {
@@ -1021,9 +2074,28 @@ private struct WorkspaceKeyboardShortcutCapture: NSViewRepresentable {
                     }
                 }
 
-                let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
-                if event.keyCode == 6, modifiers == .command, canUndoMaskEdit {
+                let modifiers = event.modifierFlags.intersection([
+                    .command,
+                    .control,
+                    .option,
+                    .shift
+                ])
+                if event.keyCode == 53,
+                   modifiers.isEmpty,
+                   !(window.firstResponder is NSTextView) {
+                    deselectLayer()
+                    return nil
+                }
+                if event.keyCode == 6,
+                   modifiers == .command,
+                   canUndoMaskEdit {
                     undoMaskEdit()
+                    return nil
+                }
+                if event.keyCode == 6,
+                   modifiers == [.command, .shift],
+                   canRedoMaskEdit {
+                    redoMaskEdit()
                     return nil
                 }
 
@@ -1068,11 +2140,14 @@ private struct PreviewBackgroundView: View {
 }
 
 private struct CheckerboardView: View {
-    private let squareSize: CGFloat = 18
+    var squareSize: CGFloat = 18
 
     var body: some View {
         Canvas { context, size in
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.white))
+            context.fill(
+                Path(CGRect(origin: .zero, size: size)),
+                with: .color(.white)
+            )
 
             let columns = Int(ceil(size.width / squareSize))
             let rows = Int(ceil(size.height / squareSize))
@@ -1085,17 +2160,12 @@ private struct CheckerboardView: View {
                         width: squareSize,
                         height: squareSize
                     )
-                    context.fill(Path(rect), with: .color(Color.gray.opacity(0.28)))
+                    context.fill(
+                        Path(rect),
+                        with: .color(Color.gray.opacity(0.28))
+                    )
                 }
             }
         }
-    }
-}
-
-private extension View {
-    func sectionLabelStyle() -> some View {
-        font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(.secondary)
-            .tracking(0.8)
     }
 }
