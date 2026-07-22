@@ -399,6 +399,9 @@ private struct PreviewSurface: View {
 
     private let minimumZoom: CGFloat = 0.25
     private let maximumZoom: CGFloat = 8
+    private let minimumCanvasOverscroll: CGFloat = 72
+    private let maximumCanvasOverscroll: CGFloat = 180
+    private let canvasOverscrollRatio: CGFloat = 0.18
 
     init(
         image: NSImage?,
@@ -769,8 +772,16 @@ private struct PreviewSurface: View {
     ) -> CGSize {
         let scaledWidth = fittedSize.width * scale
         let scaledHeight = fittedSize.height * scale
-        let maximumX = abs(viewportSize.width - scaledWidth) / 2
-        let maximumY = abs(viewportSize.height - scaledHeight) / 2
+        let horizontalCanvasSpace = min(
+            max(viewportSize.width * canvasOverscrollRatio, minimumCanvasOverscroll),
+            maximumCanvasOverscroll
+        )
+        let verticalCanvasSpace = min(
+            max(viewportSize.height * canvasOverscrollRatio, minimumCanvasOverscroll),
+            maximumCanvasOverscroll
+        )
+        let maximumX = abs(viewportSize.width - scaledWidth) / 2 + horizontalCanvasSpace
+        let maximumY = abs(viewportSize.height - scaledHeight) / 2 + verticalCanvasSpace
 
         return CGSize(
             width: min(max(proposed.width, -maximumX), maximumX),
