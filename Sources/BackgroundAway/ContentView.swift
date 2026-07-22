@@ -771,7 +771,7 @@ private struct LayerListPopover: View {
 
             Spacer(minLength: 4)
 
-            if layer.isProcessing {
+            if layer.isProcessing || layer.isRefining {
                 ProgressView()
                     .controlSize(.small)
             }
@@ -958,6 +958,8 @@ private struct MaskToolPalette: View {
 private struct SelectedLayerInspector: View {
     @ObservedObject var appState: AppState
     let layerID: UUID
+    @State private var showsCanvasAnchors = false
+    @State private var showsEdgeSettings = false
 
     var body: some View {
         if let layer = currentLayer,
@@ -1020,6 +1022,29 @@ private struct SelectedLayerInspector: View {
                     )
                 }
 
+                HStack(spacing: 8) {
+                    Text("Положение центра")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer(minLength: 4)
+
+                    Button {
+                        showsCanvasAnchors.toggle()
+                    } label: {
+                        Image(systemName: "square.grid.3x3")
+                            .frame(width: 22, height: 22)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Выровнять слой относительно холста")
+                    .popover(isPresented: $showsCanvasAnchors, arrowEdge: .trailing) {
+                        CanvasAnchorPopover(
+                            appState: appState,
+                            layerID: layerID
+                        )
+                    }
+                }
+
                 HStack(spacing: 6) {
                     numericField(
                         title: "X",
@@ -1048,6 +1073,47 @@ private struct SelectedLayerInspector: View {
                     .frame(width: 64)
                     Text("%")
                         .foregroundStyle(.secondary)
+                }
+
+                if layer.kind == .object {
+                    Divider()
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "circle.lefthalf.filled")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Text("Край")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Spacer(minLength: 4)
+
+                        if layer.isRefining {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .help("Обновляем край")
+                        }
+
+                        Text(layer.edgeSettings.isAutomatic ? "Авто" : "Вручную")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Button {
+                            showsEdgeSettings.toggle()
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .frame(width: 22, height: 22)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Настроить край")
+                        .popover(isPresented: $showsEdgeSettings, arrowEdge: .trailing) {
+                            EdgeSettingsPopover(
+                                appState: appState,
+                                layerID: layerID
+                            )
+                        }
+                    }
                 }
             }
             .controlSize(.small)
@@ -1158,6 +1224,179 @@ private struct SelectedLayerInspector: View {
             Text(suffix)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct CanvasAnchorPopover: View {
+    @ObservedObject var appState: AppState
+    let layerID: UUID
+    @Environment(\.dismiss) private var dismiss
+
+    private let columns = Array(
+        repeating: GridItem(.fixed(42), spacing: 8),
+        count: 3
+    )
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Выровнять по холсту")
+                .font(.headline)
+
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(AppState.CanvasAnchor.allCases) { anchor in
+                    Button {
+                        appState.alignLayer(layerID, to: anchor)
+                        dismiss()
+                    } label: {
+                        Image(systemName: anchor.symbolName)
+                            .font(.system(size: 14, weight: .medium))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.bordered)
+                    .help(anchor.title)
+                    .accessibilityLabel(anchor.title)
+                }
+            }
+
+            Text("X и Y показывают координаты центра слоя от левого верхнего угла холста.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(canvasSizeTitle)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.tertiary)
+        }
+        .padding(16)
+        .frame(width: 210)
+    }
+
+    private var canvasSizeTitle: String {
+        "Холст: \(Int(appState.canvasSize.width.rounded())) × \(Int(appState.canvasSize.height.rounded())) px"
+    }
+}
+
+private struct EdgeSettingsPopover: View {
+    @ObservedObject var appState: AppState
+    let layerID: UUID
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Text("Обработка края")
+                    .font(.headline)
+
+                Spacer()
+
+                if currentLayer?.isRefining == true {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Toggle("Подбирать автоматически", isOn: automaticBinding)
+                .toggleStyle(.switch)
+
+            if let layer = currentLayer {
+                if layer.edgeSettings.isAutomatic {
+                    Text("Сглаживание и очистка цветного ореола подбираются под разрешение изображения.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    edgeSlider(
+                        title: "Сглаживание",
+                        value: featherBinding,
+                        range: 0...3,
+                        step: 0.1,
+                        valueText: String(format: "%.1f px", layer.edgeSettings.feather)
+                    )
+
+                    edgeSlider(
+                        title: "Сдвиг края",
+                        value: shiftBinding,
+                        range: -2...2,
+                        step: 0.1,
+                        valueText: String(format: "%+.1f px", layer.edgeSettings.shift)
+                    )
+
+                    edgeSlider(
+                        title: "Очистка ореола",
+                        value: cleanupBinding,
+                        range: 0...1,
+                        step: 0.05,
+                        valueText: "\(Int((layer.edgeSettings.haloCleanup * 100).rounded()))%"
+                    )
+                }
+
+                Divider()
+
+                Button {
+                    appState.resetLayerEdgeSettings(layerID)
+                } label: {
+                    Label("Вернуть автоматические настройки", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(.plain)
+                .disabled(layer.edgeSettings == .standard || layer.isProcessing)
+            }
+        }
+        .controlSize(.small)
+        .padding(16)
+        .frame(width: 300)
+        .disabled(currentLayer?.isProcessing == true)
+    }
+
+    private var currentLayer: AppState.ImageLayer? {
+        appState.layers.first(where: { $0.id == layerID })
+    }
+
+    private var automaticBinding: Binding<Bool> {
+        Binding(
+            get: { currentLayer?.edgeSettings.isAutomatic ?? true },
+            set: { appState.setLayerEdgeAutomatic(layerID, isAutomatic: $0) }
+        )
+    }
+
+    private var featherBinding: Binding<Double> {
+        Binding(
+            get: { currentLayer?.edgeSettings.feather ?? 0.8 },
+            set: { appState.setLayerEdgeFeather(layerID, feather: $0) }
+        )
+    }
+
+    private var shiftBinding: Binding<Double> {
+        Binding(
+            get: { currentLayer?.edgeSettings.shift ?? -0.25 },
+            set: { appState.setLayerEdgeShift(layerID, shift: $0) }
+        )
+    }
+
+    private var cleanupBinding: Binding<Double> {
+        Binding(
+            get: { currentLayer?.edgeSettings.haloCleanup ?? 0.9 },
+            set: { appState.setLayerHaloCleanup(layerID, cleanup: $0) }
+        )
+    }
+
+    private func edgeSlider(
+        title: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double,
+        valueText: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                    .font(.caption)
+                Spacer()
+                Text(valueText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Slider(value: value, in: range, step: step)
         }
     }
 }

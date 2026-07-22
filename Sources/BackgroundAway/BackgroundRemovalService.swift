@@ -246,6 +246,202 @@ enum BackgroundRemovalService {
         return rendered
     }
 
+    static func refiningEdges(
+        of base: CGImage,
+        featherRadius: CGFloat,
+        edgeShift: CGFloat,
+        haloCleanup: CGFloat
+    ) throws -> CGImage {
+        try Task.checkCancellation()
+
+        let width = base.width
+        let height = base.height
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw BackgroundRemovalError.cannotCreateImage
+        }
+
+        var basePixels = [UInt8](repeating: 0, count: width * height * 4)
+        basePixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            context.render(
+                CIImage(cgImage: base),
+                toBitmap: baseAddress,
+                rowBytes: width * 4,
+                bounds: extent,
+                format: .RGBA8,
+                colorSpace: colorSpace
+            )
+        }
+
+        var baseAlpha = [UInt8](repeating: 0, count: width * height)
+        for pixelIndex in 0..<(width * height) {
+            if pixelIndex.isMultiple(of: 65_536) {
+                try Task.checkCancellation()
+            }
+            baseAlpha[pixelIndex] = basePixels[pixelIndex * 4 + 3]
+        }
+
+        var refinedMask = CIImage(
+            bitmapData: Data(baseAlpha),
+            bytesPerRow: width,
+            size: CGSize(width: width, height: height),
+            format: .R8,
+            colorSpace: nil
+        )
+        .cropped(to: extent)
+
+        let safeShift = min(max(edgeShift, -8), 8)
+        if abs(safeShift) >= 0.01 {
+            refinedMask = refinedMask
+                .clampedToExtent()
+                .applyingFilter(
+                    safeShift < 0 ? "CIMorphologyMinimum" : "CIMorphologyMaximum",
+                    parameters: [kCIInputRadiusKey: abs(safeShift)]
+                )
+                .cropped(to: extent)
+        }
+
+        let safeFeather = min(max(featherRadius, 0), 8)
+        if safeFeather >= 0.01 {
+            refinedMask = refinedMask
+                .clampedToExtent()
+                .applyingFilter(
+                    "CIGaussianBlur",
+                    parameters: [kCIInputRadiusKey: safeFeather]
+                )
+                .cropped(to: extent)
+        }
+
+        var refinedAlpha = [UInt8](repeating: 0, count: width * height)
+        refinedAlpha.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            context.render(
+                refinedMask,
+                toBitmap: baseAddress,
+                rowBytes: width,
+                bounds: extent,
+                format: .R8,
+                colorSpace: nil
+            )
+        }
+
+        let cleanup = min(max(haloCleanup, 0), 1)
+        let searchRadius = min(
+            max(Int(ceil(abs(safeShift) + safeFeather * 3 + 2)), 2),
+            12
+        )
+        var outputPixels = [UInt8](repeating: 0, count: width * height * 4)
+
+        func straightComponent(_ value: UInt8, alpha: UInt8) -> CGFloat {
+            guard alpha > 0 else { return 0 }
+            return min(CGFloat(value) * 255 / CGFloat(alpha), 255)
+        }
+
+        for y in 0..<height {
+            if y.isMultiple(of: 8) {
+                try Task.checkCancellation()
+            }
+            for x in 0..<width {
+                let pixelIndex = y * width + x
+                var newAlpha = refinedAlpha[pixelIndex]
+                if newAlpha <= 1 {
+                    continue
+                }
+                if newAlpha >= 254 {
+                    newAlpha = 255
+                }
+
+                let sourceIndex = pixelIndex * 4
+                let oldAlpha = baseAlpha[pixelIndex]
+                if newAlpha == 255, oldAlpha == 255 {
+                    outputPixels[sourceIndex] = basePixels[sourceIndex]
+                    outputPixels[sourceIndex + 1] = basePixels[sourceIndex + 1]
+                    outputPixels[sourceIndex + 2] = basePixels[sourceIndex + 2]
+                    outputPixels[sourceIndex + 3] = 255
+                    continue
+                }
+
+                var interiorPixelIndex = pixelIndex
+                var bestAlpha = oldAlpha
+                var bestDistanceSquared = Int.max
+
+                if oldAlpha == 0 || cleanup > 0 {
+                    let minimumY = max(0, y - searchRadius)
+                    let maximumY = min(height - 1, y + searchRadius)
+                    let minimumX = max(0, x - searchRadius)
+                    let maximumX = min(width - 1, x + searchRadius)
+
+                    for candidateY in minimumY...maximumY {
+                        for candidateX in minimumX...maximumX {
+                            let candidateIndex = candidateY * width + candidateX
+                            let candidateAlpha = baseAlpha[candidateIndex]
+                            let deltaX = candidateX - x
+                            let deltaY = candidateY - y
+                            let distanceSquared = deltaX * deltaX + deltaY * deltaY
+
+                            if candidateAlpha > bestAlpha ||
+                                (candidateAlpha == bestAlpha &&
+                                    distanceSquared < bestDistanceSquared) {
+                                bestAlpha = candidateAlpha
+                                bestDistanceSquared = distanceSquared
+                                interiorPixelIndex = candidateIndex
+                            }
+                        }
+                    }
+                }
+
+                let interiorIndex = interiorPixelIndex * 4
+                let interiorAlpha = baseAlpha[interiorPixelIndex]
+                let forcedInterior = oldAlpha == 0
+                let edgeAlpha = CGFloat(min(oldAlpha, newAlpha)) / 255
+                let normalizedAlpha = min(max((edgeAlpha - 0.55) / 0.43, 0), 1)
+                let smoothAlpha = normalizedAlpha * normalizedAlpha * (3 - 2 * normalizedAlpha)
+                let mix = forcedInterior ? CGFloat(1) : cleanup * (1 - smoothAlpha)
+
+                for component in 0..<3 {
+                    let edgeColor = oldAlpha > 0
+                        ? straightComponent(
+                            basePixels[sourceIndex + component],
+                            alpha: oldAlpha
+                        )
+                        : straightComponent(
+                            basePixels[interiorIndex + component],
+                            alpha: interiorAlpha
+                        )
+                    let interiorColor = straightComponent(
+                        basePixels[interiorIndex + component],
+                        alpha: interiorAlpha
+                    )
+                    let color = edgeColor + (interiorColor - edgeColor) * mix
+                    outputPixels[sourceIndex + component] = UInt8(
+                        min(max((color * CGFloat(newAlpha) / 255).rounded(), 0), 255)
+                    )
+                }
+                outputPixels[sourceIndex + 3] = newAlpha
+            }
+        }
+
+        guard let provider = CGDataProvider(data: Data(outputPixels) as CFData),
+              let image = CGImage(
+                  width: width,
+                  height: height,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: width * 4,
+                  space: colorSpace,
+                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+                      .union(.byteOrder32Big),
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: true,
+                  intent: .defaultIntent
+              ) else {
+            throw BackgroundRemovalError.cannotCreateImage
+        }
+        return image
+    }
+
     static func compose(
         layers: [CompositionLayer],
         canvasSize: CGSize
