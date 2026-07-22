@@ -66,6 +66,7 @@ final class AppState: ObservableObject {
     @Published private(set) var sourceURL: URL?
     @Published private(set) var isProcessing = false
     @Published private(set) var hasManualMaskEdits = false
+    @Published private(set) var canUndoMaskEdit = false
     @Published var errorMessage: String?
     @Published var previewMode: PreviewMode = .result {
         didSet {
@@ -87,6 +88,8 @@ final class AppState: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var operationID = UUID()
     private var automaticResultImage: CGImage?
+    private var previousMaskResultImage: CGImage?
+    private var previousMaskHadManualEdits = false
 
     var sourceName: String {
         sourceURL?.lastPathComponent ?? "Изображение из буфера"
@@ -121,6 +124,7 @@ final class AppState: ObservableObject {
         resultPreviewImage = nil
         automaticResultImage = nil
         hasManualMaskEdits = false
+        discardMaskUndoHistory()
         maskTool = .pan
         previewMode = .result
         errorMessage = nil
@@ -139,6 +143,7 @@ final class AppState: ObservableObject {
         resultPreviewImage = nil
         automaticResultImage = nil
         hasManualMaskEdits = false
+        discardMaskUndoHistory()
         maskTool = .pan
         previewMode = .result
         errorMessage = nil
@@ -172,6 +177,7 @@ final class AppState: ObservableObject {
         resultPreviewImage = nil
         automaticResultImage = nil
         hasManualMaskEdits = false
+        discardMaskUndoHistory()
         maskTool = .pan
         errorMessage = nil
 
@@ -215,17 +221,34 @@ final class AppState: ObservableObject {
                 radius: radius,
                 restoresPixels: maskTool == .restore
             )
+            previousMaskResultImage = currentResult
+            previousMaskHadManualEdits = hasManualMaskEdits
             setResultImage(edited)
             hasManualMaskEdits = true
+            canUndoMaskEdit = true
         } catch {
             errorMessage = "Не удалось применить кисть: \(error.localizedDescription)"
         }
     }
 
     func resetMaskEdits() {
-        guard let automaticResultImage else { return }
+        guard hasManualMaskEdits,
+              let automaticResultImage,
+              let currentResult = resultImage?.pixelCGImage else {
+            return
+        }
+        previousMaskResultImage = currentResult
+        previousMaskHadManualEdits = true
         setResultImage(automaticResultImage)
         hasManualMaskEdits = false
+        canUndoMaskEdit = true
+    }
+
+    func undoLastMaskEdit() {
+        guard let previousMaskResultImage else { return }
+        setResultImage(previousMaskResultImage)
+        hasManualMaskEdits = previousMaskHadManualEdits
+        discardMaskUndoHistory()
     }
 
     func exportResult() {
@@ -264,8 +287,15 @@ final class AppState: ObservableObject {
         sourceURL = nil
         isProcessing = false
         hasManualMaskEdits = false
+        discardMaskUndoHistory()
         maskTool = .pan
         errorMessage = nil
+    }
+
+    private func discardMaskUndoHistory() {
+        previousMaskResultImage = nil
+        previousMaskHadManualEdits = false
+        canUndoMaskEdit = false
     }
 
     private func setResultImage(_ image: CGImage, preview: CGImage? = nil) {

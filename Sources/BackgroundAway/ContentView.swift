@@ -7,43 +7,50 @@ struct ContentView: View {
     @State private var isDropTargeted = false
 
     var body: some View {
-        NavigationSplitView {
-            Sidebar(appState: appState)
-                .navigationSplitViewColumnWidth(min: 245, ideal: 275, max: 315)
-        } detail: {
-            ZStack {
-                Color(nsColor: .windowBackgroundColor)
-                    .ignoresSafeArea()
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+                .ignoresSafeArea()
 
-                if appState.originalImage == nil {
-                    EmptyDropView(isTargeted: isDropTargeted) {
-                        appState.openImagePicker()
-                    }
-                } else {
-                    PreviewWorkspace(appState: appState)
+            if appState.originalImage == nil {
+                EmptyDropView(isTargeted: isDropTargeted) {
+                    appState.openImagePicker()
                 }
-            }
-            .dropDestination(for: URL.self) { urls, _ in
-                guard let url = urls.first,
-                      UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true else {
-                    return false
-                }
-                appState.loadImage(from: url)
-                return true
-            } isTargeted: { targeted in
-                isDropTargeted = targeted
-            }
-            .overlay {
-                if isDropTargeted, appState.originalImage != nil {
-                    RoundedRectangle(cornerRadius: 18)
-                        .strokeBorder(.tint, style: StrokeStyle(lineWidth: 4, dash: [10, 8]))
-                        .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
-                        .padding(14)
-                        .allowsHitTesting(false)
-                }
+            } else {
+                PreviewWorkspace(appState: appState)
             }
         }
-        .navigationSplitViewStyle(.balanced)
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first,
+                  UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true else {
+                return false
+            }
+            appState.loadImage(from: url)
+            return true
+        } isTargeted: { targeted in
+            isDropTargeted = targeted
+        }
+        .overlay {
+            if isDropTargeted, appState.originalImage != nil {
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(.tint, style: StrokeStyle(lineWidth: 4, dash: [10, 8]))
+                    .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+                    .padding(14)
+                    .allowsHitTesting(false)
+            }
+        }
+        .background {
+            if appState.originalImage != nil {
+                WorkspaceKeyboardShortcutCapture(
+                    canEditMask: appState.resultImage != nil && !appState.isProcessing,
+                    canUndoMaskEdit: appState.canUndoMaskEdit,
+                    selectTool: { appState.maskTool = $0 },
+                    selectPreview: { appState.previewMode = $0 },
+                    undoMaskEdit: { appState.undoLastMaskEdit() }
+                )
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+            }
+        }
         .onOpenURL { url in
             appState.loadImage(from: url)
         }
@@ -60,172 +67,6 @@ struct ContentView: View {
         } message: {
             Text(appState.errorMessage ?? "Неизвестная ошибка")
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    appState.openImagePicker()
-                } label: {
-                    Label("Открыть", systemImage: "photo.badge.plus")
-                }
-
-                Button {
-                    appState.exportResult()
-                } label: {
-                    Label("Экспортировать", systemImage: "square.and.arrow.down")
-                }
-                .disabled(appState.resultImage == nil || appState.isProcessing)
-            }
-        }
-    }
-}
-
-private struct Sidebar: View {
-    @ObservedObject var appState: AppState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Label("Фон — долой!", systemImage: "wand.and.sparkles")
-                .font(.title2.weight(.semibold))
-            .padding(.horizontal, 18)
-            .padding(.top, 20)
-            .padding(.bottom, 22)
-
-            Divider()
-
-            if appState.originalImage != nil {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("ИЗОБРАЖЕНИЕ")
-                                .sectionLabelStyle()
-                            Text(appState.sourceName)
-                                .font(.callout.weight(.medium))
-                                .lineLimit(2)
-                            if let details = appState.sourceDetails {
-                                Text(details)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 9) {
-                            Text("ПРОСМОТР")
-                                .sectionLabelStyle()
-                            Picker("Режим просмотра", selection: $appState.previewMode) {
-                                ForEach(AppState.PreviewMode.allCases) { mode in
-                                    Text(mode.title).tag(mode)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                        }
-
-                        VStack(alignment: .leading, spacing: 9) {
-                            Text("ФОН ПРЕДПРОСМОТРА")
-                                .sectionLabelStyle()
-                            Picker("Фон предпросмотра", selection: $appState.previewBackground) {
-                                ForEach(AppState.PreviewBackground.allCases) { background in
-                                    Text(background.title).tag(background)
-                                }
-                            }
-                            .labelsHidden()
-                        }
-
-                        if appState.resultImage != nil, !appState.isProcessing {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("КОРРЕКЦИЯ МАСКИ")
-                                    .sectionLabelStyle()
-
-                                Picker("Инструмент", selection: $appState.maskTool) {
-                                    ForEach(AppState.MaskTool.allCases) { tool in
-                                        Label(tool.title, systemImage: tool.symbolName)
-                                            .tag(tool)
-                                    }
-                                }
-                                .labelsHidden()
-                                .pickerStyle(.segmented)
-
-                                if appState.maskTool != .pan {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: "circle")
-                                            .font(.system(size: 7))
-
-                                        Slider(value: $appState.brushDiameter, in: 8...180)
-
-                                        Image(systemName: "circle.fill")
-                                            .font(.system(size: 15))
-                                    }
-                                    .foregroundStyle(.secondary)
-
-                                    HStack {
-                                        Text("Кисть")
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        Text("\(Int(appState.brushDiameter.rounded())) pt")
-                                            .monospacedDigit()
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .font(.caption)
-                                }
-
-                                Button {
-                                    appState.resetMaskEdits()
-                                } label: {
-                                    Label("Сбросить правки", systemImage: "arrow.uturn.backward")
-                                        .frame(maxWidth: .infinity)
-                                }
-                                .disabled(!appState.hasManualMaskEdits)
-                            }
-                        }
-
-                        VStack(spacing: 10) {
-                            Button {
-                                appState.exportResult()
-                            } label: {
-                                Label("Сохранить PNG", systemImage: "square.and.arrow.down")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.large)
-                            .disabled(appState.resultImage == nil || appState.isProcessing)
-
-                            HStack(spacing: 8) {
-                                Button {
-                                    appState.copyResult()
-                                } label: {
-                                    Label("Копировать", systemImage: "doc.on.doc")
-                                        .frame(maxWidth: .infinity)
-                                }
-                                .disabled(appState.resultImage == nil || appState.isProcessing)
-
-                                Button {
-                                    appState.clear()
-                                } label: {
-                                    Image(systemName: "trash")
-                                }
-                                .help("Закрыть изображение")
-                            }
-                            .controlSize(.large)
-                        }
-                    }
-                    .padding(18)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 14) {
-                    Label("Перетащите фото в окно", systemImage: "arrow.down.doc")
-                    Label("Или нажмите ⌘O", systemImage: "command")
-                    Label("Можно вставить через ⌘V", systemImage: "doc.on.clipboard")
-                }
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .padding(18)
-
-                Spacer()
-            }
-
-            Spacer(minLength: 0)
-        }
-        .background(.regularMaterial)
     }
 }
 
@@ -275,84 +116,72 @@ private struct PreviewWorkspace: View {
     @ObservedObject var appState: AppState
 
     var body: some View {
-        VStack(spacing: 14) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(appState.isProcessing ? "Отделяем объект от фона…" : "Готово")
-                        .font(.headline)
-                    Text(appState.isProcessing ? "Apple Vision анализирует изображение на этом Mac" : "Экспорт сохраняет прозрачность в PNG")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+        VStack(spacing: 12) {
+            WorkspaceTopBar(appState: appState)
 
-                Spacer()
+            HStack(spacing: 12) {
+                MaskToolPalette(appState: appState)
 
-                if !appState.isProcessing {
-                    Button {
-                        appState.removeBackground()
-                    } label: {
-                        Label("Обработать снова", systemImage: "arrow.clockwise")
-                    }
-                }
-            }
-            .padding(.horizontal, 4)
-
-            Group {
-                switch appState.previewMode {
-                case .result:
-                    PreviewSurface(
-                        image: isMaskPainting
-                            ? appState.resultImage
-                            : appState.resultPreviewImage ?? appState.resultImage ?? appState.originalImage,
-                        background: appState.previewBackground,
-                        label: "Результат",
-                        viewportIdentity: sourceIdentity,
-                        maskEditing: maskEditingConfiguration
-                    )
-                case .original:
-                    PreviewSurface(
-                        image: appState.originalImage,
-                        background: .white,
-                        label: "Оригинал",
-                        viewportIdentity: sourceIdentity
-                    )
-                case .comparison:
-                    HStack(spacing: 12) {
-                        PreviewSurface(
-                            image: appState.originalImage,
-                            background: .white,
-                            label: "До",
-                            viewportIdentity: sourceIdentity
-                        )
-                        PreviewSurface(
-                            image: appState.resultImage ?? appState.originalImage,
-                            background: appState.previewBackground,
-                            label: "После",
-                            viewportIdentity: sourceIdentity
-                        )
-                    }
-                }
-            }
-            .overlay {
-                if appState.isProcessing {
-                    ZStack {
-                        Rectangle()
-                            .fill(.black.opacity(0.18))
-                        VStack(spacing: 12) {
-                            ProgressView()
-                                .controlSize(.large)
-                            Text("Удаляем фон…")
-                                .font(.headline)
+                previewContent
+                    .overlay {
+                        if appState.isProcessing {
+                            ZStack {
+                                Rectangle()
+                                    .fill(.black.opacity(0.18))
+                                VStack(spacing: 12) {
+                                    ProgressView()
+                                        .controlSize(.large)
+                                    Text("Удаляем фон…")
+                                        .font(.headline)
+                                }
+                                .padding(.horizontal, 24)
+                                .padding(.vertical, 18)
+                                .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 14))
+                            }
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 18)
-                        .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 14))
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                }
             }
         }
-        .padding(18)
+        .padding(14)
+    }
+
+    @ViewBuilder
+    private var previewContent: some View {
+        switch appState.previewMode {
+        case .result:
+            PreviewSurface(
+                image: isMaskPainting
+                    ? appState.resultImage
+                    : appState.resultPreviewImage ?? appState.resultImage ?? appState.originalImage,
+                background: appState.previewBackground,
+                label: "",
+                viewportIdentity: sourceIdentity,
+                maskEditing: maskEditingConfiguration
+            )
+        case .original:
+            PreviewSurface(
+                image: appState.originalImage,
+                background: .white,
+                label: "",
+                viewportIdentity: sourceIdentity
+            )
+        case .comparison:
+            HStack(spacing: 12) {
+                PreviewSurface(
+                    image: appState.originalImage,
+                    background: .white,
+                    label: "Оригинал",
+                    viewportIdentity: sourceIdentity
+                )
+                PreviewSurface(
+                    image: appState.resultImage ?? appState.originalImage,
+                    background: appState.previewBackground,
+                    label: "Результат",
+                    viewportIdentity: sourceIdentity
+                )
+            }
+        }
     }
 
     private var sourceIdentity: ObjectIdentifier? {
@@ -372,6 +201,226 @@ private struct PreviewWorkspace: View {
         ) { points, radius in
             appState.applyMaskStroke(normalizedPoints: points, radius: radius)
         }
+    }
+}
+
+private struct WorkspaceTopBar: View {
+    @ObservedObject var appState: AppState
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Menu {
+                previewButton(.original, shortcut: "Tab+1")
+                previewButton(.result, shortcut: "Tab+2")
+                previewButton(.comparison, shortcut: "Tab+3")
+            } label: {
+                Label(appState.previewMode.title, systemImage: previewSymbol)
+            }
+            .help("Режим просмотра")
+
+            Menu {
+                ForEach(AppState.PreviewBackground.allCases) { background in
+                    Button {
+                        appState.previewBackground = background
+                    } label: {
+                        Label(
+                            background.title,
+                            systemImage: appState.previewBackground == background ? "checkmark" : backgroundSymbol(background)
+                        )
+                    }
+                }
+            } label: {
+                Label(appState.previewBackground.title, systemImage: "circle.lefthalf.filled")
+            }
+            .help("Фон предпросмотра")
+
+            Spacer(minLength: 12)
+
+            if appState.isProcessing {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            Button {
+                appState.exportResult()
+            } label: {
+                Label("Сохранить", systemImage: "square.and.arrow.down")
+            }
+            .disabled(appState.resultImage == nil || appState.isProcessing)
+            .help("Сохранить PNG (⌘S)")
+
+            Button {
+                appState.clear()
+            } label: {
+                Image(systemName: "trash")
+                    .frame(width: 18)
+            }
+            .help("Закрыть изображение")
+
+            Button {
+                appState.removeBackground()
+            } label: {
+                Label("Обработать снова", systemImage: "arrow.clockwise")
+            }
+            .disabled(appState.isProcessing)
+        }
+        .controlSize(.large)
+        .padding(8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.secondary.opacity(0.18))
+        }
+    }
+
+    private var previewSymbol: String {
+        switch appState.previewMode {
+        case .original: "photo"
+        case .result: "wand.and.stars"
+        case .comparison: "rectangle.split.2x1"
+        }
+    }
+
+    private func previewButton(_ mode: AppState.PreviewMode, shortcut: String) -> some View {
+        Button {
+            appState.previewMode = mode
+        } label: {
+            HStack {
+                if appState.previewMode == mode {
+                    Image(systemName: "checkmark")
+                }
+                Text(mode.title)
+                Spacer()
+                Text(shortcut)
+            }
+        }
+    }
+
+    private func backgroundSymbol(_ background: AppState.PreviewBackground) -> String {
+        switch background {
+        case .checkerboard: "checkerboard.rectangle"
+        case .white: "circle"
+        case .black: "circle.fill"
+        }
+    }
+}
+
+private struct MaskToolPalette: View {
+    @ObservedObject var appState: AppState
+    @State private var showsBrushSize = false
+
+    private var canEdit: Bool {
+        appState.resultImage != nil && !appState.isProcessing
+    }
+
+    private var maskToolIsSelected: Bool {
+        appState.maskTool == .erase || appState.maskTool == .restore
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Button {
+                appState.maskTool = .pan
+            } label: {
+                paletteIcon("hand.draw", selected: appState.maskTool == .pan)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canEdit)
+            .help("Перемещение (V)")
+
+            Menu {
+                Button {
+                    appState.maskTool = .erase
+                } label: {
+                    Label("Удалить — X", systemImage: "eraser")
+                }
+
+                Button {
+                    appState.maskTool = .restore
+                } label: {
+                    Label("Вернуть — B", systemImage: "paintbrush")
+                }
+            } label: {
+                paletteIcon("rectangle.dashed", selected: maskToolIsSelected)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(!canEdit)
+            .help("Коррекция маски")
+
+            if maskToolIsSelected {
+                Button {
+                    showsBrushSize.toggle()
+                } label: {
+                    paletteIcon("circle.dotted", selected: showsBrushSize)
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $showsBrushSize, arrowEdge: .leading) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("Размер кисти")
+                                .font(.headline)
+                            Spacer()
+                            Text("\(Int(appState.brushDiameter.rounded())) pt")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack(spacing: 10) {
+                            Image(systemName: "circle")
+                                .font(.system(size: 7))
+                            Slider(value: $appState.brushDiameter, in: 8...180)
+                            Image(systemName: "circle.fill")
+                                .font(.system(size: 15))
+                        }
+                        .foregroundStyle(.secondary)
+                    }
+                    .padding(14)
+                    .frame(width: 250)
+                }
+                .help("Размер кисти")
+            }
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Button {
+                appState.undoLastMaskEdit()
+            } label: {
+                paletteIcon("arrow.uturn.backward", selected: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(!appState.canUndoMaskEdit)
+            .help("Отменить последнее изменение (⌘Z)")
+
+            Button {
+                appState.resetMaskEdits()
+            } label: {
+                paletteIcon("arrow.counterclockwise", selected: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(!appState.hasManualMaskEdits)
+            .help("Сбросить все правки маски")
+
+            Spacer(minLength: 0)
+        }
+        .padding(7)
+        .frame(width: 48)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.secondary.opacity(0.18))
+        }
+    }
+
+    private func paletteIcon(_ symbol: String, selected: Bool) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .frame(width: 34, height: 34)
+            .background(selected ? Color.accentColor : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(Rectangle())
     }
 }
 
@@ -428,12 +477,14 @@ private struct PreviewSurface: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(alignment: .topLeading) {
-            Text(label)
-                .font(.caption.weight(.medium))
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(.ultraThickMaterial, in: Capsule())
-                .padding(12)
+            if !label.isEmpty {
+                Text(label)
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(.ultraThickMaterial, in: Capsule())
+                    .padding(12)
+            }
         }
         .overlay(alignment: .bottomTrailing) {
             if image != nil {
@@ -870,6 +921,134 @@ private struct TrackpadPanCapture: NSViewRepresentable {
             self.eventMonitor = nil
         }
 
+    }
+}
+
+private struct WorkspaceKeyboardShortcutCapture: NSViewRepresentable {
+    let canEditMask: Bool
+    let canUndoMaskEdit: Bool
+    let selectTool: (AppState.MaskTool) -> Void
+    let selectPreview: (AppState.PreviewMode) -> Void
+    let undoMaskEdit: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            canEditMask: canEditMask,
+            canUndoMaskEdit: canUndoMaskEdit,
+            selectTool: selectTool,
+            selectPreview: selectPreview,
+            undoMaskEdit: undoMaskEdit
+        )
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.view = view
+        context.coordinator.installMonitor()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.view = nsView
+        context.coordinator.canEditMask = canEditMask
+        context.coordinator.canUndoMaskEdit = canUndoMaskEdit
+        context.coordinator.selectTool = selectTool
+        context.coordinator.selectPreview = selectPreview
+        context.coordinator.undoMaskEdit = undoMaskEdit
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.removeMonitor()
+    }
+
+    @MainActor
+    final class Coordinator {
+        weak var view: NSView?
+        var canEditMask: Bool
+        var canUndoMaskEdit: Bool
+        var selectTool: (AppState.MaskTool) -> Void
+        var selectPreview: (AppState.PreviewMode) -> Void
+        var undoMaskEdit: () -> Void
+
+        private var eventMonitor: Any?
+        private var tabIsHeld = false
+
+        init(
+            canEditMask: Bool,
+            canUndoMaskEdit: Bool,
+            selectTool: @escaping (AppState.MaskTool) -> Void,
+            selectPreview: @escaping (AppState.PreviewMode) -> Void,
+            undoMaskEdit: @escaping () -> Void
+        ) {
+            self.canEditMask = canEditMask
+            self.canUndoMaskEdit = canUndoMaskEdit
+            self.selectTool = selectTool
+            self.selectPreview = selectPreview
+            self.undoMaskEdit = undoMaskEdit
+        }
+
+        func installMonitor() {
+            guard eventMonitor == nil else { return }
+
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+                guard let self,
+                      let view = self.view,
+                      let window = view.window,
+                      event.window === window else {
+                    return event
+                }
+
+                if event.keyCode == 48 {
+                    tabIsHeld = event.type == .keyDown
+                    return nil
+                }
+
+                guard event.type == .keyDown, !event.isARepeat else { return event }
+
+                if tabIsHeld {
+                    switch event.keyCode {
+                    case 18:
+                        selectPreview(.original)
+                        return nil
+                    case 19:
+                        selectPreview(.result)
+                        return nil
+                    case 20:
+                        selectPreview(.comparison)
+                        return nil
+                    default:
+                        break
+                    }
+                }
+
+                let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+                if event.keyCode == 6, modifiers == .command, canUndoMaskEdit {
+                    undoMaskEdit()
+                    return nil
+                }
+
+                guard modifiers.isEmpty, canEditMask else { return event }
+                switch event.keyCode {
+                case 9:
+                    selectTool(.pan)
+                    return nil
+                case 7:
+                    selectTool(.erase)
+                    return nil
+                case 11:
+                    selectTool(.restore)
+                    return nil
+                default:
+                    return event
+                }
+            }
+        }
+
+        func removeMonitor() {
+            guard let eventMonitor else { return }
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
     }
 }
 
