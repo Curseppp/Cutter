@@ -131,6 +131,53 @@ private struct Sidebar: View {
                             .labelsHidden()
                         }
 
+                        if appState.resultImage != nil, !appState.isProcessing {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("КОРРЕКЦИЯ МАСКИ")
+                                    .sectionLabelStyle()
+
+                                Picker("Инструмент", selection: $appState.maskTool) {
+                                    ForEach(AppState.MaskTool.allCases) { tool in
+                                        Label(tool.title, systemImage: tool.symbolName)
+                                            .tag(tool)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.segmented)
+
+                                if appState.maskTool != .pan {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "circle")
+                                            .font(.system(size: 7))
+
+                                        Slider(value: $appState.brushDiameter, in: 8...180)
+
+                                        Image(systemName: "circle.fill")
+                                            .font(.system(size: 15))
+                                    }
+                                    .foregroundStyle(.secondary)
+
+                                    HStack {
+                                        Text("Кисть")
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Text("\(Int(appState.brushDiameter.rounded())) pt")
+                                            .monospacedDigit()
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .font(.caption)
+                                }
+
+                                Button {
+                                    appState.resetMaskEdits()
+                                } label: {
+                                    Label("Сбросить правки", systemImage: "arrow.uturn.backward")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .disabled(!appState.hasManualMaskEdits)
+                            }
+                        }
+
                         VStack(spacing: 10) {
                             Button {
                                 appState.exportResult()
@@ -254,27 +301,34 @@ private struct PreviewWorkspace: View {
                 switch appState.previewMode {
                 case .result:
                     PreviewSurface(
-                        image: appState.resultPreviewImage ?? appState.resultImage ?? appState.originalImage,
+                        image: isMaskPainting
+                            ? appState.resultImage
+                            : appState.resultPreviewImage ?? appState.resultImage ?? appState.originalImage,
                         background: appState.previewBackground,
-                        label: "Результат"
+                        label: "Результат",
+                        viewportIdentity: sourceIdentity,
+                        maskEditing: maskEditingConfiguration
                     )
                 case .original:
                     PreviewSurface(
                         image: appState.originalImage,
                         background: .white,
-                        label: "Оригинал"
+                        label: "Оригинал",
+                        viewportIdentity: sourceIdentity
                     )
                 case .comparison:
                     HStack(spacing: 12) {
                         PreviewSurface(
                             image: appState.originalImage,
                             background: .white,
-                            label: "До"
+                            label: "До",
+                            viewportIdentity: sourceIdentity
                         )
                         PreviewSurface(
                             image: appState.resultImage ?? appState.originalImage,
                             background: appState.previewBackground,
-                            label: "После"
+                            label: "После",
+                            viewportIdentity: sourceIdentity
                         )
                     }
                 }
@@ -300,20 +354,65 @@ private struct PreviewWorkspace: View {
         }
         .padding(18)
     }
+
+    private var sourceIdentity: ObjectIdentifier? {
+        appState.originalImage.map(ObjectIdentifier.init)
+    }
+
+    private var isMaskPainting: Bool {
+        appState.resultImage != nil && appState.maskTool != .pan
+    }
+
+    private var maskEditingConfiguration: MaskEditingConfiguration? {
+        guard appState.resultImage != nil else { return nil }
+        return MaskEditingConfiguration(
+            tool: appState.maskTool,
+            brushDiameter: CGFloat(appState.brushDiameter),
+            originalImage: appState.originalImage
+        ) { points, radius in
+            appState.applyMaskStroke(normalizedPoints: points, radius: radius)
+        }
+    }
+}
+
+private struct MaskEditingConfiguration {
+    let tool: AppState.MaskTool
+    let brushDiameter: CGFloat
+    let originalImage: NSImage?
+    let applyStroke: ([CGPoint], CGFloat) -> Void
 }
 
 private struct PreviewSurface: View {
     let image: NSImage?
     let background: AppState.PreviewBackground
     let label: String
+    let viewportIdentity: ObjectIdentifier?
+    let maskEditing: MaskEditingConfiguration?
 
     @State private var zoomScale: CGFloat = 1
     @State private var panOffset: CGSize = .zero
+    @State private var activeStrokeLocations: [CGPoint] = []
+    @State private var activeStrokePoints: [CGPoint] = []
+    @State private var brushCursorLocation: CGPoint?
     @GestureState private var gestureMagnification: CGFloat = 1
     @GestureState private var gestureTranslation: CGSize = .zero
 
     private let minimumZoom: CGFloat = 0.25
     private let maximumZoom: CGFloat = 8
+
+    init(
+        image: NSImage?,
+        background: AppState.PreviewBackground,
+        label: String,
+        viewportIdentity: ObjectIdentifier? = nil,
+        maskEditing: MaskEditingConfiguration? = nil
+    ) {
+        self.image = image
+        self.background = background
+        self.label = label
+        self.viewportIdentity = viewportIdentity
+        self.maskEditing = maskEditing
+    }
 
     var body: some View {
         ZStack {
@@ -343,17 +442,26 @@ private struct PreviewSurface: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(.secondary.opacity(0.2))
         }
-        .onChange(of: imageIdentifier) {
+        .onChange(of: viewportIdentity) { _, _ in
+            resetViewport()
+        }
+        .onChange(of: isPaintingMask) { _, _ in
+            cancelActiveStroke()
             resetViewport()
         }
     }
 
-    private var imageIdentifier: ObjectIdentifier? {
-        image.map(ObjectIdentifier.init)
-    }
-
     private var visibleZoomScale: CGFloat {
         clampedZoom(zoomScale * gestureMagnification)
+    }
+
+    private var isPaintingMask: Bool {
+        guard let tool = maskEditing?.tool else { return false }
+        return tool == .erase || tool == .restore
+    }
+
+    private var brushColor: Color {
+        maskEditing?.tool == .restore ? .green : .red
     }
 
     private var zoomControls: some View {
@@ -421,34 +529,85 @@ private struct PreviewSurface: View {
                 viewportSize: viewportSize,
                 scale: visibleZoomScale
             )
+            let renderedSize = CGSize(
+                width: fittedSize.width * visibleZoomScale,
+                height: fittedSize.height * visibleZoomScale
+            )
+            let imageRect = CGRect(
+                x: geometry.size.width / 2 + displayedOffset.width - renderedSize.width / 2,
+                y: geometry.size.height / 2 + displayedOffset.height - renderedSize.height / 2,
+                width: renderedSize.width,
+                height: renderedSize.height
+            )
 
-            Image(nsImage: image)
-                .resizable()
-                .interpolation(.high)
-                .antialiased(true)
-                .frame(width: fittedSize.width, height: fittedSize.height)
-                .scaleEffect(visibleZoomScale)
-                .position(
-                    x: geometry.size.width / 2 + displayedOffset.width,
-                    y: geometry.size.height / 2 + displayedOffset.height
+            ZStack {
+                if maskEditing?.tool == .restore,
+                   let originalImage = maskEditing?.originalImage {
+                    positionedImage(
+                        originalImage,
+                        fittedSize: fittedSize,
+                        displayedOffset: displayedOffset,
+                        geometrySize: geometry.size
+                    )
+                    .opacity(0.22)
+                }
+
+                positionedImage(
+                    image,
+                    fittedSize: fittedSize,
+                    displayedOffset: displayedOffset,
+                    geometrySize: geometry.size
                 )
-                .contentShape(Rectangle())
+
+                if isPaintingMask {
+                    brushOverlay
+                        .allowsHitTesting(false)
+                }
+
+                TrackpadPanCapture { translation in
+                    let proposed = CGSize(
+                        width: panOffset.width + translation.width,
+                        height: panOffset.height + translation.height
+                    )
+                    panOffset = constrainedOffset(
+                        proposed,
+                        fittedSize: fittedSize,
+                        viewportSize: viewportSize,
+                        scale: zoomScale
+                    )
+                }
+                .allowsHitTesting(false)
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .contentShape(Rectangle())
                 .gesture(
-                    DragGesture(minimumDistance: 1)
+                    DragGesture(minimumDistance: isPaintingMask ? 0 : 1)
                         .updating($gestureTranslation) { value, state, _ in
-                            state = value.translation
+                            if !isPaintingMask {
+                                state = value.translation
+                            }
+                        }
+                        .onChanged { value in
+                            if isPaintingMask {
+                                appendBrushPoint(value.location, in: imageRect)
+                            }
                         }
                         .onEnded { value in
-                            let proposed = CGSize(
-                                width: panOffset.width + value.translation.width,
-                                height: panOffset.height + value.translation.height
-                            )
-                            panOffset = constrainedOffset(
-                                proposed,
-                                fittedSize: fittedSize,
-                                viewportSize: viewportSize,
-                                scale: zoomScale
-                            )
+                            if isPaintingMask {
+                                appendBrushPoint(value.location, in: imageRect)
+                                finishBrushStroke(on: image, imageRect: imageRect)
+                            } else {
+                                let proposed = CGSize(
+                                    width: panOffset.width + value.translation.width,
+                                    height: panOffset.height + value.translation.height
+                                )
+                                panOffset = constrainedOffset(
+                                    proposed,
+                                    fittedSize: fittedSize,
+                                    viewportSize: viewportSize,
+                                    scale: zoomScale
+                                )
+                            }
                         }
                 )
                 .simultaneousGesture(
@@ -468,12 +627,132 @@ private struct PreviewSurface: View {
                         }
                 )
                 .onTapGesture(count: 2) {
-                    resetViewport()
+                    if !isPaintingMask {
+                        resetViewport()
+                    }
+                }
+                .onContinuousHover { phase in
+                    guard isPaintingMask else {
+                        brushCursorLocation = nil
+                        return
+                    }
+
+                    switch phase {
+                    case .active(let location):
+                        brushCursorLocation = imageRect.contains(location) ? location : nil
+                    case .ended:
+                        brushCursorLocation = nil
+                    }
                 }
                 .animation(.snappy(duration: 0.2), value: zoomScale)
                 .animation(.snappy(duration: 0.2), value: panOffset)
         }
         .clipped()
+    }
+
+    private func positionedImage(
+        _ image: NSImage,
+        fittedSize: CGSize,
+        displayedOffset: CGSize,
+        geometrySize: CGSize
+    ) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .interpolation(.high)
+            .antialiased(true)
+            .frame(width: fittedSize.width, height: fittedSize.height)
+            .scaleEffect(visibleZoomScale)
+            .position(
+                x: geometrySize.width / 2 + displayedOffset.width,
+                y: geometrySize.height / 2 + displayedOffset.height
+            )
+    }
+
+    private var brushOverlay: some View {
+        Canvas { context, _ in
+            if let cursor = brushCursorLocation,
+               let diameter = maskEditing?.brushDiameter {
+                let cursorRect = CGRect(
+                    x: cursor.x - diameter / 2,
+                    y: cursor.y - diameter / 2,
+                    width: diameter,
+                    height: diameter
+                )
+                context.stroke(
+                    Path(ellipseIn: cursorRect),
+                    with: .color(brushColor.opacity(0.95)),
+                    lineWidth: 1.5
+                )
+            }
+
+            guard !activeStrokeLocations.isEmpty,
+                  let diameter = maskEditing?.brushDiameter else {
+                return
+            }
+
+            if activeStrokeLocations.count == 1, let point = activeStrokeLocations.first {
+                let dabRect = CGRect(
+                    x: point.x - diameter / 2,
+                    y: point.y - diameter / 2,
+                    width: diameter,
+                    height: diameter
+                )
+                context.fill(Path(ellipseIn: dabRect), with: .color(brushColor.opacity(0.3)))
+            } else {
+                var path = Path()
+                if let first = activeStrokeLocations.first {
+                    path.move(to: first)
+                    for point in activeStrokeLocations.dropFirst() {
+                        path.addLine(to: point)
+                    }
+                    context.stroke(
+                        path,
+                        with: .color(brushColor.opacity(0.3)),
+                        style: StrokeStyle(lineWidth: diameter, lineCap: .round, lineJoin: .round)
+                    )
+                }
+            }
+        }
+    }
+
+    private func appendBrushPoint(_ location: CGPoint, in imageRect: CGRect) {
+        guard imageRect.width > 0,
+              imageRect.height > 0,
+              imageRect.contains(location) else {
+            return
+        }
+
+        if let previous = activeStrokeLocations.last {
+            let deltaX = location.x - previous.x
+            let deltaY = location.y - previous.y
+            guard deltaX * deltaX + deltaY * deltaY >= 1 else { return }
+        }
+
+        activeStrokeLocations.append(location)
+        activeStrokePoints.append(CGPoint(
+            x: (location.x - imageRect.minX) / imageRect.width,
+            y: (location.y - imageRect.minY) / imageRect.height
+        ))
+    }
+
+    private func finishBrushStroke(on image: NSImage, imageRect: CGRect) {
+        defer { cancelActiveStroke() }
+
+        guard let maskEditing,
+              !activeStrokePoints.isEmpty,
+              imageRect.width > 0 else {
+            return
+        }
+
+        let pixelWidth = CGFloat(image.pixelCGImage?.width ?? max(Int(image.size.width), 1))
+        let radius = maskEditing.brushDiameter * pixelWidth / imageRect.width / 2
+        maskEditing.applyStroke(activeStrokePoints, radius)
+    }
+
+    private func cancelActiveStroke() {
+        activeStrokeLocations.removeAll(keepingCapacity: true)
+        activeStrokePoints.removeAll(keepingCapacity: true)
+        brushCursorLocation = nil
     }
 
     private func aspectFitSize(_ imageSize: CGSize, in viewportSize: CGSize) -> CGSize {
@@ -514,6 +793,72 @@ private struct PreviewSurface: View {
             zoomScale = 1
             panOffset = .zero
         }
+    }
+}
+
+private struct TrackpadPanCapture: NSViewRepresentable {
+    let onPan: (CGSize) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPan: onPan)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.view = view
+        context.coordinator.installMonitor()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.view = nsView
+        context.coordinator.onPan = onPan
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.removeMonitor()
+    }
+
+    @MainActor
+    final class Coordinator {
+        weak var view: NSView?
+        var onPan: (CGSize) -> Void
+
+        private var eventMonitor: Any?
+
+        init(onPan: @escaping (CGSize) -> Void) {
+            self.onPan = onPan
+        }
+
+        func installMonitor() {
+            guard eventMonitor == nil else { return }
+
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self,
+                      event.hasPreciseScrollingDeltas,
+                      let view = self.view,
+                      let window = view.window,
+                      event.window === window else {
+                    return event
+                }
+
+                let location = view.convert(event.locationInWindow, from: nil)
+                guard view.bounds.contains(location) else { return event }
+
+                self.onPan(CGSize(
+                    width: event.scrollingDeltaX,
+                    height: event.scrollingDeltaY
+                ))
+                return nil
+            }
+        }
+
+        func removeMonitor() {
+            guard let eventMonitor else { return }
+            NSEvent.removeMonitor(eventMonitor)
+            self.eventMonitor = nil
+        }
+
     }
 }
 

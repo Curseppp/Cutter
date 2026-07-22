@@ -145,6 +145,101 @@ enum BackgroundRemovalService {
         return cropped
     }
 
+    static func applyingMaskStroke(
+        to result: CGImage,
+        restoringFrom source: CGImage,
+        normalizedPoints: [CGPoint],
+        radius: CGFloat,
+        restoresPixels: Bool
+    ) throws -> CGImage {
+        guard !normalizedPoints.isEmpty,
+              result.width == source.width,
+              result.height == source.height else {
+            return result
+        }
+
+        let width = result.width
+        let height = result.height
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+        let grayColorSpace = CGColorSpaceCreateDeviceGray()
+
+        guard let maskContext = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: grayColorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            throw BackgroundRemovalError.cannotCreateImage
+        }
+
+        maskContext.setFillColor(gray: 0, alpha: 1)
+        maskContext.fill(extent)
+        maskContext.setAllowsAntialiasing(true)
+        maskContext.setShouldAntialias(true)
+        maskContext.setStrokeColor(gray: 1, alpha: 1)
+        maskContext.setFillColor(gray: 1, alpha: 1)
+        maskContext.setLineCap(.round)
+        maskContext.setLineJoin(.round)
+        maskContext.setLineWidth(max(radius * 2, 1))
+
+        let pixelPoints = normalizedPoints.map { point in
+            CGPoint(
+                x: min(max(point.x, 0), 1) * CGFloat(max(width - 1, 1)),
+                y: (1 - min(max(point.y, 0), 1)) * CGFloat(max(height - 1, 1))
+            )
+        }
+
+        if let firstPoint = pixelPoints.first {
+            if pixelPoints.count == 1 {
+                let diameter = max(radius * 2, 1)
+                maskContext.fillEllipse(in: CGRect(
+                    x: firstPoint.x - diameter / 2,
+                    y: firstPoint.y - diameter / 2,
+                    width: diameter,
+                    height: diameter
+                ))
+            } else {
+                maskContext.move(to: firstPoint)
+                for point in pixelPoints.dropFirst() {
+                    maskContext.addLine(to: point)
+                }
+                maskContext.strokePath()
+            }
+        }
+
+        guard let strokeMask = maskContext.makeImage() else {
+            throw BackgroundRemovalError.cannotCreateImage
+        }
+
+        let featherRadius = min(max(radius * 0.08, 0.75), 6)
+        let maskImage = CIImage(cgImage: strokeMask)
+            .clampedToExtent()
+            .applyingFilter(
+                "CIGaussianBlur",
+                parameters: [kCIInputRadiusKey: featherRadius]
+            )
+            .cropped(to: extent)
+
+        let resultImage = CIImage(cgImage: result)
+        let replacementImage = restoresPixels
+            ? CIImage(cgImage: source)
+            : CIImage(color: .clear).cropped(to: extent)
+        let blend = CIFilter.blendWithMask()
+        blend.inputImage = replacementImage
+        blend.backgroundImage = resultImage
+        blend.maskImage = maskImage
+
+        guard let output = blend.outputImage?.cropped(to: extent),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let rendered = context.createCGImage(output, from: extent, format: .RGBA8, colorSpace: colorSpace) else {
+            throw BackgroundRemovalError.cannotCreateImage
+        }
+        return rendered
+    }
+
     private static func removeChromaBackground(from source: CGImage) throws -> CGImage? {
         let width = source.width
         let height = source.height

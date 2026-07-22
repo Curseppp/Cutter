@@ -36,17 +36,57 @@ final class AppState: ObservableObject {
         }
     }
 
+    enum MaskTool: String, CaseIterable, Identifiable {
+        case pan
+        case erase
+        case restore
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .pan: "Двигать"
+            case .erase: "Удалить"
+            case .restore: "Вернуть"
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .pan: "hand.draw"
+            case .erase: "eraser"
+            case .restore: "paintbrush"
+            }
+        }
+    }
+
     @Published private(set) var originalImage: NSImage?
     @Published private(set) var resultImage: NSImage?
     @Published private(set) var resultPreviewImage: NSImage?
     @Published private(set) var sourceURL: URL?
     @Published private(set) var isProcessing = false
+    @Published private(set) var hasManualMaskEdits = false
     @Published var errorMessage: String?
-    @Published var previewMode: PreviewMode = .result
+    @Published var previewMode: PreviewMode = .result {
+        didSet {
+            if previewMode != .result, maskTool != .pan {
+                maskTool = .pan
+            }
+        }
+    }
     @Published var previewBackground: PreviewBackground = .checkerboard
+    @Published var maskTool: MaskTool = .pan {
+        didSet {
+            if maskTool != .pan {
+                previewMode = .result
+            }
+        }
+    }
+    @Published var brushDiameter: Double = 56
 
     private var processingTask: Task<Void, Never>?
     private var operationID = UUID()
+    private var automaticResultImage: CGImage?
 
     var sourceName: String {
         sourceURL?.lastPathComponent ?? "Изображение из буфера"
@@ -79,6 +119,9 @@ final class AppState: ObservableObject {
         originalImage = image
         resultImage = nil
         resultPreviewImage = nil
+        automaticResultImage = nil
+        hasManualMaskEdits = false
+        maskTool = .pan
         previewMode = .result
         errorMessage = nil
         removeBackground()
@@ -94,6 +137,9 @@ final class AppState: ObservableObject {
         originalImage = image
         resultImage = nil
         resultPreviewImage = nil
+        automaticResultImage = nil
+        hasManualMaskEdits = false
+        maskTool = .pan
         previewMode = .result
         errorMessage = nil
         removeBackground()
@@ -124,6 +170,9 @@ final class AppState: ObservableObject {
         isProcessing = true
         resultImage = nil
         resultPreviewImage = nil
+        automaticResultImage = nil
+        hasManualMaskEdits = false
+        maskTool = .pan
         errorMessage = nil
 
         processingTask = Task {
@@ -135,14 +184,8 @@ final class AppState: ObservableObject {
                 }.value
 
                 guard !Task.isCancelled, operationID == currentOperationID else { return }
-                resultImage = NSImage(
-                    cgImage: images.0,
-                    size: NSSize(width: images.0.width, height: images.0.height)
-                )
-                resultPreviewImage = NSImage(
-                    cgImage: images.1,
-                    size: NSSize(width: images.1.width, height: images.1.height)
-                )
+                automaticResultImage = images.0
+                setResultImage(images.0, preview: images.1)
                 isProcessing = false
             } catch is CancellationError {
                 if operationID == currentOperationID {
@@ -154,6 +197,35 @@ final class AppState: ObservableObject {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    func applyMaskStroke(normalizedPoints: [CGPoint], radius: CGFloat) {
+        guard maskTool != .pan,
+              !normalizedPoints.isEmpty,
+              let currentResult = resultImage?.pixelCGImage,
+              let source = originalImage?.pixelCGImage else {
+            return
+        }
+
+        do {
+            let edited = try BackgroundRemovalService.applyingMaskStroke(
+                to: currentResult,
+                restoringFrom: source,
+                normalizedPoints: normalizedPoints,
+                radius: radius,
+                restoresPixels: maskTool == .restore
+            )
+            setResultImage(edited)
+            hasManualMaskEdits = true
+        } catch {
+            errorMessage = "Не удалось применить кисть: \(error.localizedDescription)"
+        }
+    }
+
+    func resetMaskEdits() {
+        guard let automaticResultImage else { return }
+        setResultImage(automaticResultImage)
+        hasManualMaskEdits = false
     }
 
     func exportResult() {
@@ -188,9 +260,24 @@ final class AppState: ObservableObject {
         originalImage = nil
         resultImage = nil
         resultPreviewImage = nil
+        automaticResultImage = nil
         sourceURL = nil
         isProcessing = false
+        hasManualMaskEdits = false
+        maskTool = .pan
         errorMessage = nil
+    }
+
+    private func setResultImage(_ image: CGImage, preview: CGImage? = nil) {
+        let previewImage = preview ?? BackgroundRemovalService.centeredPreviewCrop(from: image)
+        resultImage = NSImage(
+            cgImage: image,
+            size: NSSize(width: image.width, height: image.height)
+        )
+        resultPreviewImage = NSImage(
+            cgImage: previewImage,
+            size: NSSize(width: previewImage.width, height: previewImage.height)
+        )
     }
 
     private var suggestedExportName: String {
